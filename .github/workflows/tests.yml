@@ -1,0 +1,52 @@
+name: CI
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest-ARM64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "nightly"
+
+      - name: version info
+        run: rustc --version; cargo --version;
+
+      - name: Run all tests
+        run: cargo test
+
+  fmt:
+    runs-on: ubuntu-latest-ARM64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+
+      - run: |
+          rustup component add rustfmt
+          cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest-ARM64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "nightly"
+
+      - run: |
+          rustup component add clippy
+          cargo clippy -- -D warnings
+
