@@ -1,0 +1,16 @@
+[package]
+name = "simdcsv"
+authors = ["Matthew Kim"]
+version = "0.1.0"
+edition = "2024"
+description = "A CSV parser"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.98"
+
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
