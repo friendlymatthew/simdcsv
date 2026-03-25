@@ -1,5 +1,6 @@
 use std::arch::aarch64::{
-    uint8x16_t, vandq_u8, vceqq_u8, vdupq_n_u8, vld1q_u8, vqtbl1q_u8, vshrq_n_u8, vst1q_u8,
+    uint8x16_t, vandq_u8, vceqq_u8, vdupq_n_u8, vgetq_lane_u8, vld1q_u8, vpaddq_u8, vqtbl1q_u8,
+    vshrq_n_u8, vst1q_u8,
 };
 use std::fmt::{Debug, Formatter};
 use std::ops::BitAnd;
@@ -14,8 +15,6 @@ impl u8x16 {
     /// warning! this assumes slice has 16 bytes
     /// will panic if slice is not 16 bytes
     pub fn from_slice_unchecked(slice: &[u8]) -> Self {
-        assert_eq!(slice.len(), 16);
-
         unsafe { vld1q_u8(slice.as_ptr()) }.into()
     }
 
@@ -44,18 +43,15 @@ impl u8x16 {
         unsafe { vceqq_u8(self.0, other.0) }.into()
     }
 
-    // figure out a better way to do this
-    // maybe just get the MSB
     pub fn bitset(self) -> u16 {
-        let bs: [u8; 16] = self.into();
-
-        let mut mask = 0u16;
-
-        for (i, b) in bs.into_iter().enumerate() {
-            mask |= ((b != 0) as u16) << (15 - i);
+        let weights = Self::from([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128]);
+        let bits = (self & weights).0;
+        unsafe {
+            let p1 = vpaddq_u8(bits, bits);
+            let p2 = vpaddq_u8(p1, p1);
+            let p3 = vpaddq_u8(p2, p2);
+            (vgetq_lane_u8::<0>(p3) as u16) | ((vgetq_lane_u8::<1>(p3) as u16) << 8)
         }
-
-        mask
     }
 }
 

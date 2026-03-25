@@ -1,110 +1,45 @@
-pub const COMMA_CLASS: u8 = 1;
-pub const NEW_LINE_CLASS: u8 = 2;
-pub const QUOTATION_CLASS: u8 = 4;
+use crate::u8x16;
 
-pub const LO_LOOKUP: [u8; 16] = [
-    0,
-    0,
-    QUOTATION_CLASS,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    NEW_LINE_CLASS,
-    0,
-    COMMA_CLASS,
-    NEW_LINE_CLASS,
-    0,
-    0,
-];
+pub const COMMA: u8 = 1;
+pub const NEWLINE: u8 = 2;
+pub const QUOTES: u8 = 4;
 
-pub const HI_LOOKUP: [u8; 16] = [
-    NEW_LINE_CLASS,
-    0,
-    COMMA_CLASS | QUOTATION_CLASS,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-];
+pub const LOW_NIBBLES: [u8; 16] = {
+    let mut out = [0u8; 16];
+    out[0x2] = QUOTES;
+    out[0xA] = NEWLINE;
+    out[0xC] = COMMA;
+    out[0xD] = NEWLINE;
 
-use crate::u8x16::u8x16;
+    out
+};
 
-#[derive(Debug)]
-pub struct CsvClassifier<'a> {
-    cursor: usize,
-    data: &'a [u8],
-}
+pub const HIGH_NIBBLES: [u8; 16] = {
+    let mut out = [0u8; 16];
+    out[0x0] = NEWLINE;
+    out[0x2] = COMMA | QUOTES;
 
-impl<'a> CsvClassifier<'a> {
-    pub const fn new(data: &'a [u8]) -> Self {
-        Self { cursor: 0, data }
+    out
+};
+
+// note: data must be a multiple of 16
+pub fn classify(data: &[u8]) -> Vec<u8x16> {
+    let low_nibbles = u8x16::from_slice_unchecked(&LOW_NIBBLES);
+    let high_nibbles = u8x16::from_slice_unchecked(&HIGH_NIBBLES);
+
+    let chunks = data.chunks_exact(u8x16::LANE_COUNT);
+
+    let mut out = Vec::with_capacity(data.len() / 16);
+
+    for chunk in chunks {
+        let v = u8x16::from_slice_unchecked(chunk);
+        let (high, low) = v.nibbles();
+
+        let res = high_nibbles.classify(high) & low_nibbles.classify(low);
+        out.push(res);
     }
 
-    pub fn classify(&mut self) -> Vec<u8x16> {
-        let mut bitsets = Vec::new();
-
-        let high_nibble_lookup = u8x16::from_slice_unchecked(&HI_LOOKUP);
-        let low_nibble_lookup = u8x16::from_slice_unchecked(&LO_LOOKUP);
-
-        while self.cursor < self.data.len() {
-            let (lanes, _aligned) = self.load_u8x16();
-
-            let (hi_lanes, lo_lanes) = lanes.nibbles();
-            let res = high_nibble_lookup.classify(hi_lanes) & low_nibble_lookup.classify(lo_lanes);
-
-            bitsets.push(res);
-        }
-
-        // if data length is exactly aligned to 16 bytes and doesn't end with a \n
-        // the last load_u8x16 took the fast path and no new line was appended
-        let last = self.data[self.data.len() - 1];
-        if self.data.len().is_multiple_of(16) && last != 0x0A && last != 0x0D {
-            let mut temp = [0u8; 16];
-            temp[0] = 0x0A;
-
-            let (hi, lo) = u8x16::from_slice_unchecked(&temp).nibbles();
-
-            bitsets.push(high_nibble_lookup.classify(hi) & low_nibble_lookup.classify(lo));
-        }
-
-        bitsets
-    }
-
-    fn load_u8x16(&mut self) -> (u8x16, bool) {
-        if self.cursor + u8x16::LANE_COUNT < self.data.len() {
-            let slice = &self.data[self.cursor..self.cursor + u8x16::LANE_COUNT];
-            self.cursor += u8x16::LANE_COUNT;
-
-            return (u8x16::from_slice_unchecked(slice), true);
-        }
-
-        let slice = &self.data[self.cursor..];
-        self.cursor = self.data.len();
-
-        let mut temp = [0u8; 16];
-        let copy_len = slice.len().min(16);
-        temp[..copy_len].copy_from_slice(&slice[..copy_len]);
-
-        let last = self.data[self.data.len() - 1];
-        if last != 0x0A && last != 0x0D && copy_len < 16 {
-            temp[copy_len] = 0x0A;
-        }
-
-        (u8x16::from_slice_unchecked(&temp), false)
-    }
+    out
 }
 
 #[cfg(test)]
@@ -113,8 +48,10 @@ mod tests {
 
     #[test]
     fn test_basic_classify() {
-        let mut classifier = CsvClassifier::new(b"a,b,c\nf,\"g\"");
-        let bitsets = classifier.classify();
+        let mut data = b"a,b,c\nf,\"g\"".to_vec();
+        data.resize(data.len().next_multiple_of(16), 0);
+
+        let bitsets = classify(&data);
 
         assert_eq!(bitsets.len(), 1);
         let res: [u8; 16] = bitsets[0].into();
@@ -122,22 +59,7 @@ mod tests {
         assert_eq!(
             res,
             [
-                0,
-                COMMA_CLASS,
-                0,
-                COMMA_CLASS,
-                0,
-                NEW_LINE_CLASS,
-                0,
-                COMMA_CLASS,
-                QUOTATION_CLASS,
-                0,
-                QUOTATION_CLASS,
-                NEW_LINE_CLASS, // we always add a \n at the end
-                0,
-                0,
-                0,
-                0,
+                0, COMMA, 0, COMMA, 0, NEWLINE, 0, COMMA, QUOTES, 0, QUOTES, 0, 0, 0, 0, 0,
             ]
         );
     }

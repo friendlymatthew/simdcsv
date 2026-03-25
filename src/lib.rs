@@ -2,6 +2,7 @@
 
 mod classify;
 mod read;
-mod u8x16;
+mod simd;
 
 pub use read::*;
+pub(crate) use simd::*;
