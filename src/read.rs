@@ -36,7 +36,7 @@ pub fn read(data: &[u8]) -> Vec<RowRef> {
 
     for i in 0..quotation_bitsets.len() {
         let quotations = quotation_bitsets[i];
-        let outside_quotations = !mark_inside_quotations(quotations, carry);
+        let outside_quotations = !unsafe { mark_inside_quotations(quotations, carry) };
 
         carry ^= (quotations.count_ones() & 1) != 0;
 
@@ -77,8 +77,13 @@ pub fn read(data: &[u8]) -> Vec<RowRef> {
             // consume the structual character
             end += 1;
 
-            valid_commas <<= bits_traveled + 1;
-            valid_new_line <<= bits_traveled + 1;
+            let shift = bits_traveled + 1;
+            if shift >= 64 {
+                start = end;
+                break;
+            }
+            valid_commas <<= shift;
+            valid_new_line <<= shift;
 
             start = end;
         }
@@ -88,8 +93,9 @@ pub fn read(data: &[u8]) -> Vec<RowRef> {
 }
 
 #[inline]
-fn mark_inside_quotations(x: u64, carry: bool) -> u64 {
-    let out = unsafe { vmull_p64(x.reverse_bits(), 0xFFFFFFFFFFFFFFFF_u64) } as u64;
+#[target_feature(enable = "neon,aes")]
+unsafe fn mark_inside_quotations(x: u64, carry: bool) -> u64 {
+    let out = vmull_p64(x.reverse_bits(), 0xFFFFFFFFFFFFFFFF_u64) as u64;
 
     let out = out.reverse_bits();
     let out = if carry { !out } else { out };
@@ -208,6 +214,14 @@ mod tests {
                 "\"b\"\"bb\"".to_string(),
                 "\"ccc\"".to_string(),
             ]],
+        );
+    }
+
+    #[test]
+    fn read_with_hyphen() {
+        parse_rows(
+            b"a,b\n1,-1\n",
+            vec![vec!["a".into(), "b".into()], vec!["1".into(), "-1".into()]],
         );
     }
 

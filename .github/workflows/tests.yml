@@ -7,10 +7,12 @@ on:
 
 jobs:
   tests:
-    runs-on: ubuntu-latest-ARM64
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -23,7 +25,7 @@ jobs:
         run: cargo test
 
   fmt:
-    runs-on: ubuntu-latest-ARM64
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,7 +39,7 @@ jobs:
           cargo fmt --all -- --check
 
   clippy:
-    runs-on: ubuntu-latest-ARM64
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v4

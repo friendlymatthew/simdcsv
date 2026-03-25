@@ -6,11 +6,13 @@ edition = "2024"
 description = "A CSV parser"
 license = "MIT"
 
-[dependencies]
-anyhow = "1.0.98"
-
 [dev-dependencies]
 insta = "1.46.3"
+criterion = "0.8.2"
+
+[[bench]]
+name = "parse"
+harness = false
 
 [profile.release]
 panic = "abort"

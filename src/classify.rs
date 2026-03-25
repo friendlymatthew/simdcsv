@@ -1,6 +1,6 @@
 pub const COMMA_CLASS: u8 = 1;
 pub const NEW_LINE_CLASS: u8 = 2;
-pub const QUOTATION_CLASS: u8 = 3;
+pub const QUOTATION_CLASS: u8 = 4;
 
 pub const LO_LOOKUP: [u8; 16] = [
     0,
