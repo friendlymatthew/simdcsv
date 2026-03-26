@@ -1,4 +1,4 @@
-use simdcsv::read;
+use arrow_csv2::read;
 
 #[test]
 fn read_taxi_zone_lookup() {

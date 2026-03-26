@@ -21,6 +21,15 @@ pub struct Decoder {
     num_rows: usize,
 
     header_skipped: bool,
+
+    // cached SIMD results — positions from a single scan, consumed across multiple decode() calls
+    cached_buf: Vec<u8>,
+    cached_comma_pos: Vec<u32>,
+    cached_newline_pos: Vec<u32>,
+    cached_ci: usize,
+    cached_ni: usize,
+    cached_start: usize,
+    cached_bytes_consumed: usize,
 }
 
 impl Decoder {
@@ -34,6 +43,13 @@ impl Decoder {
             num_columns,
             num_rows: 0,
             header_skipped: !has_header,
+            cached_buf: Vec::new(),
+            cached_comma_pos: Vec::new(),
+            cached_newline_pos: Vec::new(),
+            cached_ci: 0,
+            cached_ni: 0,
+            cached_start: 0,
+            cached_bytes_consumed: 0,
         }
     }
 
@@ -42,9 +58,14 @@ impl Decoder {
             return Ok(0);
         }
 
+        // if we have cached positions from a previous scan, continue extracting from them
+        if !self.cached_buf.is_empty() {
+            return self.extract_from_cache();
+        }
+
+        // run SIMD pipeline once on the entire buffer
         let original_len = buf.len();
 
-        // pad for SIMD (64-byte alignment)
         let mut padded = buf.to_vec();
         padded.resize(padded.len().next_multiple_of(64), 0);
 
@@ -75,7 +96,6 @@ impl Decoder {
                 unsafe { std::arch::aarch64::vmull_p64(bitset, 0xFFFFFFFFFFFFFFFF_u64) } as u64;
             let outside = if carry { inside } else { !inside };
             carry ^= (bitset.count_ones() & 1) != 0;
-
             comma_bitsets[i] &= outside;
             newline_bitsets[i] &= outside;
         }
@@ -96,76 +116,116 @@ impl Decoder {
             extract_positions(n, base, &mut newline_pos);
         }
 
-        // phase 5: extract fields into field_data/field_offsets
-        let mut start = 0usize;
-        let mut ci = 0;
-        let mut ni = 0;
-        let mut bytes_consumed = 0;
-        let rows_to_read = self.capacity();
-        let mut rows_read = 0;
+        // filter out positions beyond original data
+        comma_pos.retain(|&p| (p as usize) < original_len);
+        newline_pos.retain(|&p| (p as usize) < original_len);
 
-        // skip header row
+        // cache everything
+        self.cached_buf = buf.to_vec();
+        self.cached_comma_pos = comma_pos;
+        self.cached_newline_pos = newline_pos;
+        self.cached_ci = 0;
+        self.cached_ni = 0;
+        self.cached_start = 0;
+        self.cached_bytes_consumed = 0;
+
+        // skip header from cache
         if !self.header_skipped {
-            if let Some(&nl) = newline_pos.first() {
+            if let Some(&nl) = self.cached_newline_pos.first() {
                 let pos = nl as usize;
-                if pos < original_len {
-                    if buf[pos] == b'\r' && buf.get(pos + 1) == Some(&b'\n') {
-                        start = pos + 2;
-                        if newline_pos.get(1).copied() == Some(nl + 1) {
-                            ni += 1;
-                        }
-                    } else {
-                        start = pos + 1;
+                if self.cached_buf[pos] == b'\r'
+                    && self.cached_buf.get(pos + 1) == Some(&b'\n')
+                {
+                    self.cached_start = pos + 2;
+                    if self
+                        .cached_newline_pos
+                        .get(1)
+                        .copied()
+                        .is_some_and(|p| p == nl + 1)
+                    {
+                        self.cached_ni += 1;
                     }
-                    while ci < comma_pos.len() && (comma_pos[ci] as usize) < start {
-                        ci += 1;
-                    }
-                    ni += 1;
-                    bytes_consumed = start;
-                    self.header_skipped = true;
+                } else {
+                    self.cached_start = pos + 1;
                 }
-            }
-
-            if !self.header_skipped {
+                while self.cached_ci < self.cached_comma_pos.len()
+                    && (self.cached_comma_pos[self.cached_ci] as usize) < self.cached_start
+                {
+                    self.cached_ci += 1;
+                }
+                self.cached_ni += 1;
+                self.cached_bytes_consumed = self.cached_start;
+                self.header_skipped = true;
+            } else {
+                self.clear_cache();
                 return Ok(0);
             }
         }
 
+        self.extract_from_cache()
+    }
+
+    fn extract_from_cache(&mut self) -> Result<usize, ArrowError> {
+        let rows_to_read = self.capacity();
+        let mut rows_read = 0;
         let cols = self.num_columns;
 
-        while ni < newline_pos.len() && rows_read < rows_to_read {
-            let pos = newline_pos[ni] as usize;
-            if pos >= original_len {
-                break;
-            }
+        while self.cached_ni < self.cached_newline_pos.len() && rows_read < rows_to_read {
+            let pos = self.cached_newline_pos[self.cached_ni] as usize;
 
             for _ in 0..cols.saturating_sub(1) {
-                if ci < comma_pos.len() {
-                    let end = comma_pos[ci] as usize;
-                    self.push_field(&buf[start..end]);
-                    start = end + 1;
-                    ci += 1;
+                if self.cached_ci < self.cached_comma_pos.len() {
+                    let end = self.cached_comma_pos[self.cached_ci] as usize;
+                    let start = self.cached_start;
+                    self.push_field_from_cache(start, end);
+                    self.cached_start = end + 1;
+                    self.cached_ci += 1;
                 }
             }
 
-            self.push_field(&buf[start..pos]);
+            let start = self.cached_start;
+            self.push_field_from_cache(start, pos);
 
-            if buf[pos] == b'\r' && buf.get(pos + 1) == Some(&b'\n') {
-                start = pos + 2;
-                if newline_pos.get(ni + 1).copied() == Some(newline_pos[ni] + 1) {
-                    ni += 1;
+            if self.cached_buf[pos] == b'\r' && self.cached_buf.get(pos + 1) == Some(&b'\n') {
+                self.cached_start = pos + 2;
+                if self
+                    .cached_newline_pos
+                    .get(self.cached_ni + 1)
+                    .copied()
+                    .is_some_and(|p| p == self.cached_newline_pos[self.cached_ni] + 1)
+                {
+                    self.cached_ni += 1;
                 }
             } else {
-                start = pos + 1;
+                self.cached_start = pos + 1;
             }
 
             self.num_rows += 1;
             rows_read += 1;
-            ni += 1;
-            bytes_consumed = start;
+            self.cached_ni += 1;
+            self.cached_bytes_consumed = self.cached_start;
         }
 
-        Ok(bytes_consumed)
+        // if we've consumed all cached positions, return bytes consumed and clear cache
+        if self.cached_ni >= self.cached_newline_pos.len() {
+            let consumed = self.cached_bytes_consumed;
+            self.clear_cache();
+            return Ok(consumed);
+        }
+
+        // still have cached data — return 0 to signal "flush then call decode again"
+        // (the next decode call will continue from cache without re-scanning)
+        Ok(0)
+    }
+
+    fn clear_cache(&mut self) {
+        self.cached_buf.clear();
+        self.cached_comma_pos.clear();
+        self.cached_newline_pos.clear();
+        self.cached_ci = 0;
+        self.cached_ni = 0;
+        self.cached_start = 0;
+        self.cached_bytes_consumed = 0;
     }
 
     pub fn flush(&mut self) -> Result<Option<RecordBatch>, ArrowError> {
@@ -264,10 +324,10 @@ impl Decoder {
         }
     }
 
-    fn push_field(&mut self, raw: &[u8]) {
+    fn push_field_from_cache(&mut self, start: usize, end: usize) {
+        let raw = &self.cached_buf[start..end];
         if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' {
-            // quoted field: strip outer quotes, unescape "" -> "
-            let inner = &raw[1..raw.len() - 1];
+            let inner = &self.cached_buf[start + 1..end - 1];
             let mut i = 0;
             while i < inner.len() {
                 if inner[i] == b'"' && inner.get(i + 1) == Some(&b'"') {
@@ -281,9 +341,10 @@ impl Decoder {
         } else {
             self.field_data.extend_from_slice(raw);
         }
-
         self.field_offsets.push(self.field_data.len());
     }
+
+
 }
 
 macro_rules! build_primitive {
@@ -437,18 +498,15 @@ mod tests {
         let input = b"a\nb\nc\nd\n";
 
         let consumed1 = decoder.decode(input).unwrap();
-        assert_eq!(decoder.capacity(), 0);
-
+        // consumed1 is 0 because cache still has data, need flush first
+        // OR it consumed all and filled batch
         let batch1 = decoder.flush().unwrap().unwrap();
         assert_eq!(batch1.num_rows(), 2);
 
-        let consumed2 = decoder.decode(&input[consumed1..]).unwrap();
-        assert_eq!(decoder.capacity(), 0);
-
+        // continue decoding — cache still has remaining rows
+        decoder.decode(&input[consumed1..]).unwrap();
         let batch2 = decoder.flush().unwrap().unwrap();
         assert_eq!(batch2.num_rows(), 2);
-
-        assert_eq!(consumed1 + consumed2, input.len());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 [package]
-name = "simdcsv"
+name = "arrow-csv2"
 authors = ["Matthew Kim"]
 version = "0.1.0"
 edition = "2024"
@@ -14,6 +14,11 @@ arrow-cast = "55"
 [dev-dependencies]
 insta = "1.46.3"
 criterion = "0.8.2"
+arrow-csv = "55"
+
+[[bin]]
+name = "slice_clickbench"
+path = "bin/slice_clickbench.rs"
 
 [[bench]]
 name = "parse"

@@ -1,4 +1,4 @@
-use simdcsv::read;
+use arrow_csv2::read;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).expect("expect .csv file path");
