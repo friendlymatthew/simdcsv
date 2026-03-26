@@ -6,6 +6,11 @@ edition = "2024"
 description = "A CSV parser"
 license = "MIT"
 
+[dependencies]
+arrow-schema = "55"
+arrow-array = "55"
+arrow-cast = "55"
+
 [dev-dependencies]
 insta = "1.46.3"
 criterion = "0.8.2"
@@ -15,5 +20,6 @@ name = "parse"
 harness = false
 
 [profile.release]
+lto = "fat"
 panic = "abort"
 codegen-units = 1
