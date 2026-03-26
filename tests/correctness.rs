@@ -35,10 +35,7 @@ fn decode_all(
     batches
 }
 
-fn decode_all_arrow_csv(
-    raw: &[u8],
-    schema: Arc<Schema>,
-) -> Vec<arrow_array::RecordBatch> {
+fn decode_all_arrow_csv(raw: &[u8], schema: Arc<Schema>) -> Vec<arrow_array::RecordBatch> {
     let mut decoder = arrow_csv::ReaderBuilder::new(schema)
         .with_header(true)
         .with_batch_size(8192)
@@ -79,7 +76,11 @@ fn arrow_csv2_matches_arrow_csv() {
     assert_eq!(ours.len(), theirs.len(), "batch count mismatch");
 
     for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
-        assert_eq!(a.num_rows(), b.num_rows(), "row count mismatch in batch {i}");
+        assert_eq!(
+            a.num_rows(),
+            b.num_rows(),
+            "row count mismatch in batch {i}"
+        );
         assert_eq!(
             a.num_columns(),
             b.num_columns(),
