@@ -8,7 +8,7 @@ A secondary goal is to demonstrate a performant parallel object store reader tha
 
 # Status
 
-Currently, `arrow-csv2` decodes **2.4x faster** than `arrow-csv` (69ms vs 168ms). This is measured on a 100MB slice (~130K rows) of the [ClickBench](https://github.com/ClickHouse/ClickBench) `hits.csv` dataset.
+Currently, `arrow-csv2` decodes **3.8x faster** than `arrow-csv` (44ms vs 168ms). This is measured on a 100MB slice (~130K rows) of the [ClickBench](https://github.com/ClickHouse/ClickBench) `hits.csv` dataset.
 
 ```sh
 # run benchmarks
