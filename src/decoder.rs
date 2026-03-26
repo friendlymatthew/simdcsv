@@ -64,8 +64,6 @@ impl Decoder {
         }
 
         // run SIMD pipeline once on the entire buffer
-        let original_len = buf.len();
-
         let mut padded = buf.to_vec();
         padded.resize(padded.len().next_multiple_of(64), 0);
 
@@ -119,10 +117,6 @@ impl Decoder {
             extract_positions(c, base, &mut comma_pos);
             extract_positions(n, base, &mut newline_pos);
         }
-
-        // filter out positions beyond original data
-        comma_pos.retain(|&p| (p as usize) < original_len);
-        newline_pos.retain(|&p| (p as usize) < original_len);
 
         // cache everything
         self.cached_buf = buf.to_vec();
