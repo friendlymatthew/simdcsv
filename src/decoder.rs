@@ -63,9 +63,13 @@ impl Decoder {
             return self.extract_from_cache();
         }
 
-        // run SIMD pipeline once on the entire buffer
-        let mut padded = buf.to_vec();
-        padded.resize(padded.len().next_multiple_of(64), 0);
+        self.cached_buf.clear();
+        self.cached_buf.extend_from_slice(buf);
+
+        let original_len = self.cached_buf.len();
+        self.cached_buf.resize(original_len.next_multiple_of(64), 0);
+
+        let padded = &self.cached_buf;
 
         // phase 1+2: classify and build bitsets in one pass
         let low_nibbles = u8x16::from_slice_unchecked(&LOW_NIBBLES);
@@ -118,8 +122,7 @@ impl Decoder {
             extract_positions(n, base, &mut newline_pos);
         }
 
-        // cache everything
-        self.cached_buf = buf.to_vec();
+        self.cached_buf.truncate(original_len);
         self.cached_comma_pos = comma_pos;
         self.cached_newline_pos = newline_pos;
         self.cached_ci = 0;
