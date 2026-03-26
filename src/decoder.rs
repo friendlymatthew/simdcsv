@@ -7,7 +7,7 @@ use arrow_array::builder::{
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, SchemaRef};
 
-use crate::classify::{COMMA, NEWLINE, QUOTES, classify};
+use crate::classify::{COMMA, HIGH_NIBBLES, LOW_NIBBLES, NEWLINE, QUOTES};
 use crate::u8x16;
 
 #[derive(Debug)]
@@ -69,24 +69,28 @@ impl Decoder {
         let mut padded = buf.to_vec();
         padded.resize(padded.len().next_multiple_of(64), 0);
 
-        // phase 1: classify
-        let vectors = classify(&padded);
-
-        // phase 2: bitsets
+        // phase 1+2: classify and build bitsets in one pass
+        let low_nibbles = u8x16::from_slice_unchecked(&LOW_NIBBLES);
+        let high_nibbles = u8x16::from_slice_unchecked(&HIGH_NIBBLES);
         let comma_bc = u8x16::broadcast(COMMA);
         let newline_bc = u8x16::broadcast(NEWLINE);
         let quote_bc = u8x16::broadcast(QUOTES);
 
-        let cap = vectors.len() / 4;
+        let cap = padded.len() / 64;
         let mut comma_bitsets = Vec::with_capacity(cap);
         let mut newline_bitsets = Vec::with_capacity(cap);
         let mut quote_bitsets = Vec::with_capacity(cap);
 
-        vectors.chunks_exact(4).for_each(|chunk| {
-            comma_bitsets.push(build_u64(chunk, comma_bc));
-            newline_bitsets.push(build_u64(chunk, newline_bc));
-            quote_bitsets.push(build_u64(chunk, quote_bc));
-        });
+        for chunk in padded.chunks_exact(64) {
+            let v0 = classify_one(&chunk[0..16], high_nibbles, low_nibbles);
+            let v1 = classify_one(&chunk[16..32], high_nibbles, low_nibbles);
+            let v2 = classify_one(&chunk[32..48], high_nibbles, low_nibbles);
+            let v3 = classify_one(&chunk[48..64], high_nibbles, low_nibbles);
+
+            comma_bitsets.push(build_u64_from_classified(v0, v1, v2, v3, comma_bc));
+            newline_bitsets.push(build_u64_from_classified(v0, v1, v2, v3, newline_bc));
+            quote_bitsets.push(build_u64_from_classified(v0, v1, v2, v3, quote_bc));
+        }
 
         // phase 3: quote mask
         let mut carry = false;
@@ -133,9 +137,7 @@ impl Decoder {
         if !self.header_skipped {
             if let Some(&nl) = self.cached_newline_pos.first() {
                 let pos = nl as usize;
-                if self.cached_buf[pos] == b'\r'
-                    && self.cached_buf.get(pos + 1) == Some(&b'\n')
-                {
+                if self.cached_buf[pos] == b'\r' && self.cached_buf.get(pos + 1) == Some(&b'\n') {
                     self.cached_start = pos + 2;
                     if self
                         .cached_newline_pos
@@ -343,8 +345,6 @@ impl Decoder {
         }
         self.field_offsets.push(self.field_data.len());
     }
-
-
 }
 
 macro_rules! build_primitive {
@@ -372,12 +372,19 @@ macro_rules! build_primitive {
 }
 use build_primitive;
 
-#[inline]
-fn build_u64(chunks: &[u8x16], broadcast: u8x16) -> u64 {
-    let a = chunks[0].eq(broadcast).bitset() as u64;
-    let b = chunks[1].eq(broadcast).bitset() as u64;
-    let c = chunks[2].eq(broadcast).bitset() as u64;
-    let d = chunks[3].eq(broadcast).bitset() as u64;
+#[inline(always)]
+fn classify_one(chunk: &[u8], high_nibbles: u8x16, low_nibbles: u8x16) -> u8x16 {
+    let v = u8x16::from_slice_unchecked(chunk);
+    let (high, low) = v.nibbles();
+    high_nibbles.classify(high) & low_nibbles.classify(low)
+}
+
+#[inline(always)]
+fn build_u64_from_classified(v0: u8x16, v1: u8x16, v2: u8x16, v3: u8x16, broadcast: u8x16) -> u64 {
+    let a = v0.eq(broadcast).bitset() as u64;
+    let b = v1.eq(broadcast).bitset() as u64;
+    let c = v2.eq(broadcast).bitset() as u64;
+    let d = v3.eq(broadcast).bitset() as u64;
     a | (b << 16) | (c << 32) | (d << 48)
 }
 
