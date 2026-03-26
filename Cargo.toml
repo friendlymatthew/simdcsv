@@ -4,7 +4,7 @@ authors = ["Matthew Kim"]
 version = "0.1.0"
 edition = "2024"
 description = "A CSV parser"
-license = "MIT"
+license = "Apache 2.0"
 
 [dependencies]
 arrow-schema = "55"
@@ -25,6 +25,7 @@ name = "parse"
 harness = false
 
 [profile.release]
-lto = "fat"
+debug = 2
+# lto = "fat"
 panic = "abort"
 codegen-units = 1
