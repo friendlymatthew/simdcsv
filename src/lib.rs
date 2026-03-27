@@ -1,5 +1,6 @@
 #![warn(clippy::nursery)]
 
+mod arrow;
 mod classify;
 mod decoder;
 mod read;
