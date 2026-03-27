@@ -1,20 +1,23 @@
 use std::sync::Arc;
 
-use arrow_array::ArrayRef;
+#[cfg(debug_assertions)]
+use arrow_array::Array;
 use arrow_array::builder::{
     BinaryBuilder, BinaryViewBuilder, BooleanBuilder, Date32Builder, Date64Builder,
     Decimal128Builder, Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder,
-    Int64Builder, LargeBinaryBuilder, LargeStringBuilder, StringBuilder, StringViewBuilder,
+    Int64Builder, LargeBinaryBuilder, LargeStringBuilder, StringViewBuilder,
     TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
     TimestampSecondBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
 };
+use arrow_array::{ArrayRef, StringArray};
+use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_cast::parse::Parser;
 use arrow_schema::{ArrowError, DataType, Field, TimeUnit};
 
 pub fn build_column(
     field: &Field,
-    data: &[u8],
-    offsets: &[usize],
+    data: Vec<u8>,
+    offsets: Vec<usize>,
     col: usize,
     num_rows: usize,
 ) -> Result<ArrayRef, ArrowError> {
@@ -38,85 +41,134 @@ pub fn build_column(
             }
             Ok(Arc::new(b.finish()))
         }
-        DataType::Utf8 => build_string_col!(
-            data,
-            offsets,
-            col,
-            num_rows,
-            nullable,
-            StringBuilder::with_capacity(num_rows, data.len())
-        ),
+        DataType::Utf8 => {
+            simdutf8::basic::from_utf8(&data)
+                .map_err(|e| ArrowError::ParseError(format!("invalid utf-8 in col {col}: {e}")))?;
+
+            let nulls = if nullable {
+                let mut null_count = 0;
+                let valid = (0..num_rows)
+                    .map(|row| {
+                        let is_valid = offsets[row] != offsets[row + 1];
+                        if !is_valid {
+                            null_count += 1;
+                        }
+                        is_valid
+                    })
+                    .collect::<Vec<_>>();
+
+                (null_count > 0).then_some(NullBuffer::from(valid))
+            } else {
+                None
+            };
+
+            let i32_offsets = offsets.iter().map(|&o| o as i32).collect::<Vec<_>>();
+
+            // safety: offsets are monotonically non-decreasing and the last offset == data.len() by construction
+            // push_feild_to_column only appends to col_data and pushes col_data.len() as the next offset
+            let offset_buffer =
+                unsafe { OffsetBuffer::new_unchecked(ScalarBuffer::from(i32_offsets)) };
+
+            let value_buffer = Buffer::from_vec(data);
+
+            // safety: utf8 validated and offset invariants hold
+            let array = unsafe { StringArray::new_unchecked(offset_buffer, value_buffer, nulls) };
+
+            #[cfg(debug_assertions)]
+            array
+                .to_data()
+                .validate_full()
+                .expect("invalid stringarray");
+
+            Ok(Arc::new(array))
+        }
         DataType::LargeUtf8 => build_string_col!(
-            data,
-            offsets,
+            &data,
+            &offsets,
             col,
             num_rows,
             nullable,
             LargeStringBuilder::with_capacity(num_rows, data.len())
         ),
         DataType::Utf8View => build_string_col!(
-            data,
-            offsets,
+            &data,
+            &offsets,
             col,
             num_rows,
             nullable,
             StringViewBuilder::with_capacity(num_rows)
         ),
         DataType::Binary => build_binary_col!(
-            data,
-            offsets,
+            &data,
+            &offsets,
             num_rows,
             nullable,
             BinaryBuilder::with_capacity(num_rows, data.len())
         ),
         DataType::LargeBinary => build_binary_col!(
-            data,
-            offsets,
+            &data,
+            &offsets,
             num_rows,
             nullable,
             LargeBinaryBuilder::with_capacity(num_rows, data.len())
         ),
         DataType::BinaryView => build_binary_col!(
-            data,
-            offsets,
+            &data,
+            &offsets,
             num_rows,
             nullable,
             BinaryViewBuilder::with_capacity(num_rows)
         ),
         DataType::Int8 => {
-            build_int_col!(data, offsets, col, num_rows, nullable, Int8Builder, i8)
+            build_int_col!(&data, &offsets, col, num_rows, nullable, Int8Builder, i8)
         }
         DataType::Int16 => {
-            build_int_col!(data, offsets, col, num_rows, nullable, Int16Builder, i16)
+            build_int_col!(&data, &offsets, col, num_rows, nullable, Int16Builder, i16)
         }
         DataType::Int32 => {
-            build_int_col!(data, offsets, col, num_rows, nullable, Int32Builder, i32)
+            build_int_col!(&data, &offsets, col, num_rows, nullable, Int32Builder, i32)
         }
         DataType::Int64 => {
-            build_int_col!(data, offsets, col, num_rows, nullable, Int64Builder, i64)
+            build_int_col!(&data, &offsets, col, num_rows, nullable, Int64Builder, i64)
         }
         DataType::UInt8 => {
-            build_int_col!(data, offsets, col, num_rows, nullable, UInt8Builder, u8)
+            build_int_col!(&data, &offsets, col, num_rows, nullable, UInt8Builder, u8)
         }
         DataType::UInt16 => {
-            build_int_col!(data, offsets, col, num_rows, nullable, UInt16Builder, u16)
+            build_int_col!(&data, &offsets, col, num_rows, nullable, UInt16Builder, u16)
         }
         DataType::UInt32 => {
-            build_int_col!(data, offsets, col, num_rows, nullable, UInt32Builder, u32)
+            build_int_col!(&data, &offsets, col, num_rows, nullable, UInt32Builder, u32)
         }
         DataType::UInt64 => {
-            build_int_col!(data, offsets, col, num_rows, nullable, UInt64Builder, u64)
+            build_int_col!(&data, &offsets, col, num_rows, nullable, UInt64Builder, u64)
         }
         DataType::Float32 => {
-            build_float_col!(data, offsets, col, num_rows, nullable, Float32Builder, f32)
+            build_float_col!(
+                &data,
+                &offsets,
+                col,
+                num_rows,
+                nullable,
+                Float32Builder,
+                f32
+            )
         }
         DataType::Float64 => {
-            build_float_col!(data, offsets, col, num_rows, nullable, Float64Builder, f64)
+            build_float_col!(
+                &data,
+                &offsets,
+                col,
+                num_rows,
+                nullable,
+                Float64Builder,
+                f64
+            )
         }
         DataType::Date32 => {
             build_parsed_col!(
-                data,
-                offsets,
+                &data,
+                &offsets,
                 col,
                 num_rows,
                 nullable,
@@ -126,8 +178,8 @@ pub fn build_column(
         }
         DataType::Date64 => {
             build_parsed_col!(
-                data,
-                offsets,
+                &data,
+                &offsets,
                 col,
                 num_rows,
                 nullable,
@@ -138,8 +190,8 @@ pub fn build_column(
         DataType::Timestamp(unit, _) => match unit {
             TimeUnit::Second => {
                 build_parsed_col!(
-                    data,
-                    offsets,
+                    &data,
+                    &offsets,
                     col,
                     num_rows,
                     nullable,
@@ -149,8 +201,8 @@ pub fn build_column(
             }
             TimeUnit::Millisecond => {
                 build_parsed_col!(
-                    data,
-                    offsets,
+                    &data,
+                    &offsets,
                     col,
                     num_rows,
                     nullable,
@@ -160,8 +212,8 @@ pub fn build_column(
             }
             TimeUnit::Microsecond => {
                 build_parsed_col!(
-                    data,
-                    offsets,
+                    &data,
+                    &offsets,
                     col,
                     num_rows,
                     nullable,
@@ -171,8 +223,8 @@ pub fn build_column(
             }
             TimeUnit::Nanosecond => {
                 build_parsed_col!(
-                    data,
-                    offsets,
+                    &data,
+                    &offsets,
                     col,
                     num_rows,
                     nullable,
@@ -182,7 +234,7 @@ pub fn build_column(
             }
         },
         DataType::Decimal128(precision, scale) => {
-            simdutf8::basic::from_utf8(data)
+            simdutf8::basic::from_utf8(&data)
                 .map_err(|e| ArrowError::ParseError(format!("invalid utf-8 in col {col}: {e}")))?;
 
             let mut b = Decimal128Builder::with_capacity(num_rows)

@@ -255,22 +255,13 @@ impl Decoder {
 
         let columns = (0..self.num_columns)
             .map(|col| {
-                build_column(
-                    self.schema.field(col),
-                    &self.col_data[col],
-                    &self.col_offsets[col],
-                    col,
-                    num_rows,
-                )
+                let data = std::mem::take(&mut self.col_data[col]);
+                let offsets = std::mem::take(&mut self.col_offsets[col]);
+                build_column(self.schema.field(col), data, offsets, col, num_rows)
             })
             .collect::<Result<Vec<_>, ArrowError>>()?;
 
-        for data in &mut self.col_data {
-            data.clear();
-        }
-
         for offsets in &mut self.col_offsets {
-            offsets.clear();
             offsets.push(0);
         }
 
