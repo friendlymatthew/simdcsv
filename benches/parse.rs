@@ -18,12 +18,12 @@ fn bench_clickbench(c: &mut Criterion) {
         .expect("hits_100mb.csv not found — run: cargo run --release --bin slice_clickbench");
     let schema = clickbench_schema();
 
-    c.bench_function("arrow-csv2::read (clickbench 100MB)", |b| {
-        b.iter(|| {
-            let mut data = raw.clone();
-            read(&mut data)
-        });
-    });
+    // c.bench_function("arrow-csv2::read (clickbench 100MB)", |b| {
+    //     b.iter(|| {
+    //         let mut data = raw.clone();
+    //         read(&mut data)
+    //     });
+    // });
 
     c.bench_function("arrow-csv2::Decoder (clickbench 100MB)", |b| {
         b.iter(|| {
