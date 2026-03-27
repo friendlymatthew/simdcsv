@@ -300,7 +300,7 @@ impl Decoder {
                 Ok(Arc::new(b.finish()))
             }
             DataType::Utf8 => {
-                std::str::from_utf8(data).map_err(|e| {
+                simdutf8::basic::from_utf8(data).map_err(|e| {
                     ArrowError::ParseError(format!("invalid utf-8 in col {col}: {e}"))
                 })?;
 
@@ -318,34 +318,34 @@ impl Decoder {
                 Ok(Arc::new(b.finish()))
             }
             DataType::Int8 => {
-                build_primitive_col!(data, offsets, col, num_rows, nullable, Int8Builder, i8)
+                build_int_col!(data, offsets, col, num_rows, nullable, Int8Builder, i8)
             }
             DataType::Int16 => {
-                build_primitive_col!(data, offsets, col, num_rows, nullable, Int16Builder, i16)
+                build_int_col!(data, offsets, col, num_rows, nullable, Int16Builder, i16)
             }
             DataType::Int32 => {
-                build_primitive_col!(data, offsets, col, num_rows, nullable, Int32Builder, i32)
+                build_int_col!(data, offsets, col, num_rows, nullable, Int32Builder, i32)
             }
             DataType::Int64 => {
-                build_primitive_col!(data, offsets, col, num_rows, nullable, Int64Builder, i64)
+                build_int_col!(data, offsets, col, num_rows, nullable, Int64Builder, i64)
             }
             DataType::UInt8 => {
-                build_primitive_col!(data, offsets, col, num_rows, nullable, UInt8Builder, u8)
+                build_int_col!(data, offsets, col, num_rows, nullable, UInt8Builder, u8)
             }
             DataType::UInt16 => {
-                build_primitive_col!(data, offsets, col, num_rows, nullable, UInt16Builder, u16)
+                build_int_col!(data, offsets, col, num_rows, nullable, UInt16Builder, u16)
             }
             DataType::UInt32 => {
-                build_primitive_col!(data, offsets, col, num_rows, nullable, UInt32Builder, u32)
+                build_int_col!(data, offsets, col, num_rows, nullable, UInt32Builder, u32)
             }
             DataType::UInt64 => {
-                build_primitive_col!(data, offsets, col, num_rows, nullable, UInt64Builder, u64)
+                build_int_col!(data, offsets, col, num_rows, nullable, UInt64Builder, u64)
             }
             DataType::Float32 => {
-                build_primitive_col!(data, offsets, col, num_rows, nullable, Float32Builder, f32)
+                build_float_col!(data, offsets, col, num_rows, nullable, Float32Builder, f32)
             }
             DataType::Float64 => {
-                build_primitive_col!(data, offsets, col, num_rows, nullable, Float64Builder, f64)
+                build_float_col!(data, offsets, col, num_rows, nullable, Float64Builder, f64)
             }
             other => Err(ArrowError::NotYetImplemented(format!(
                 "data type {other} not yet supported"
@@ -375,7 +375,7 @@ impl Decoder {
     }
 }
 
-macro_rules! build_primitive_col {
+macro_rules! build_int_col {
     ($data:expr, $offsets:expr, $col:expr, $num_rows:expr, $nullable:expr, $builder:ty, $native:ty) => {{
         let mut b = <$builder>::with_capacity($num_rows);
         for row in 0..$num_rows {
@@ -383,13 +383,36 @@ macro_rules! build_primitive_col {
             if raw.is_empty() && $nullable {
                 b.append_null();
             } else {
-                let s = std::str::from_utf8(raw).map_err(|e| {
+                let v: $native = atoi::atoi(raw).ok_or_else(|| {
+                    ArrowError::ParseError(format!(
+                        "cannot parse as {} at row {}, col {}",
+                        stringify!($native),
+                        row,
+                        $col
+                    ))
+                })?;
+                b.append_value(v);
+            }
+        }
+        Ok(Arc::new(b.finish()) as ArrayRef)
+    }};
+}
+use build_int_col;
+
+macro_rules! build_float_col {
+    ($data:expr, $offsets:expr, $col:expr, $num_rows:expr, $nullable:expr, $builder:ty, $native:ty) => {{
+        let mut b = <$builder>::with_capacity($num_rows);
+        for row in 0..$num_rows {
+            let raw = &$data[$offsets[row]..$offsets[row + 1]];
+            if raw.is_empty() && $nullable {
+                b.append_null();
+            } else {
+                let s = simdutf8::basic::from_utf8(raw).map_err(|e| {
                     ArrowError::ParseError(format!(
                         "invalid utf-8 at row {}, col {}: {}",
                         row, $col, e
                     ))
                 })?;
-
                 let v: $native = s.parse().map_err(|_| {
                     ArrowError::ParseError(format!(
                         "cannot parse '{}' as {} at row {}, col {}",
@@ -405,7 +428,7 @@ macro_rules! build_primitive_col {
         Ok(Arc::new(b.finish()) as ArrayRef)
     }};
 }
-use build_primitive_col;
+use build_float_col;
 
 #[inline(always)]
 fn classify_one(chunk: &[u8], high_nibbles: u8x16, low_nibbles: u8x16) -> u8x16 {
