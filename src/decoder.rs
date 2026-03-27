@@ -15,8 +15,8 @@ pub struct Decoder {
     schema: SchemaRef,
     batch_size: usize,
 
-    field_data: Vec<u8>,
-    field_offsets: Vec<usize>,
+    col_data: Vec<Vec<u8>>,
+    col_offsets: Vec<Vec<usize>>,
     num_columns: usize,
     num_rows: usize,
 
@@ -39,8 +39,8 @@ impl Decoder {
         Self {
             schema,
             batch_size,
-            field_data: Vec::new(),
-            field_offsets: vec![0],
+            col_data: vec![Vec::new(); num_columns],
+            col_offsets: (0..num_columns).map(|_| vec![0]).collect(),
             num_columns,
             num_rows: 0,
             header_skipped: !has_header,
@@ -163,16 +163,16 @@ impl Decoder {
                 None => break,
             };
 
-            for _ in 0..cols.saturating_sub(1) {
+            for col in 0..cols.saturating_sub(1) {
                 if let Some(end) = self.next_comma() {
                     let start = self.cached_start;
-                    self.push_field_from_cache(start, end);
+                    self.push_field_to_column(col, start, end);
                     self.cached_start = end + 1;
                 }
             }
 
             let start = self.cached_start;
-            self.push_field_from_cache(start, nl_pos);
+            self.push_field_to_column(cols - 1, start, nl_pos);
 
             if self.cached_buf[nl_pos] == b'\r' && self.cached_buf.get(nl_pos + 1) == Some(&b'\n') {
                 self.cached_start = nl_pos + 2;
@@ -258,9 +258,15 @@ impl Decoder {
             .map(|col| self.build_column(col, num_rows))
             .collect::<Result<Vec<_>, ArrowError>>()?;
 
-        self.field_data.clear();
-        self.field_offsets.clear();
-        self.field_offsets.push(0);
+        for data in &mut self.col_data {
+            data.clear();
+        }
+
+        for offsets in &mut self.col_offsets {
+            offsets.clear();
+            offsets.push(0);
+        }
+
         self.num_rows = 0;
 
         RecordBatch::try_new(self.schema.clone(), columns).map(Some)
@@ -270,26 +276,17 @@ impl Decoder {
         self.batch_size - self.num_rows
     }
 
-    fn get_field(&self, row: usize, col: usize) -> &[u8] {
-        let idx = row * self.num_columns + col;
-        &self.field_data[self.field_offsets[idx]..self.field_offsets[idx + 1]]
-    }
-
-    fn get_field_str(&self, row: usize, col: usize) -> Result<&str, ArrowError> {
-        std::str::from_utf8(self.get_field(row, col)).map_err(|e| {
-            ArrowError::ParseError(format!("invalid utf-8 at row {row}, col {col}: {e}"))
-        })
-    }
-
     fn build_column(&self, col: usize, num_rows: usize) -> Result<ArrayRef, ArrowError> {
         let field = self.schema.field(col);
         let nullable = field.is_nullable();
+        let data = &self.col_data[col];
+        let offsets = &self.col_offsets[col];
 
         match field.data_type() {
             DataType::Boolean => {
                 let mut b = BooleanBuilder::with_capacity(num_rows);
                 for row in 0..num_rows {
-                    match self.get_field(row, col) {
+                    match &data[offsets[row]..offsets[row + 1]] {
                         [] if nullable => b.append_null(),
                         b"true" | b"TRUE" | b"True" | b"1" => b.append_value(true),
                         b"false" | b"FALSE" | b"False" | b"0" => b.append_value(false),
@@ -300,13 +297,18 @@ impl Decoder {
                         }
                     }
                 }
-
                 Ok(Arc::new(b.finish()))
             }
             DataType::Utf8 => {
-                let mut b = StringBuilder::with_capacity(num_rows, num_rows * 16);
+                std::str::from_utf8(data).map_err(|e| {
+                    ArrowError::ParseError(format!("invalid utf-8 in col {col}: {e}"))
+                })?;
+
+                let mut b = StringBuilder::with_capacity(num_rows, data.len());
                 for row in 0..num_rows {
-                    let s = self.get_field_str(row, col)?;
+                    let s = unsafe {
+                        std::str::from_utf8_unchecked(&data[offsets[row]..offsets[row + 1]])
+                    };
                     if s.is_empty() && nullable {
                         b.append_null();
                     } else {
@@ -315,25 +317,35 @@ impl Decoder {
                 }
                 Ok(Arc::new(b.finish()))
             }
-            DataType::Int8 => build_primitive!(self, col, num_rows, nullable, Int8Builder, i8),
-            DataType::Int16 => build_primitive!(self, col, num_rows, nullable, Int16Builder, i16),
-            DataType::Int32 => build_primitive!(self, col, num_rows, nullable, Int32Builder, i32),
-            DataType::Int64 => build_primitive!(self, col, num_rows, nullable, Int64Builder, i64),
-            DataType::UInt8 => build_primitive!(self, col, num_rows, nullable, UInt8Builder, u8),
+            DataType::Int8 => {
+                build_primitive_col!(data, offsets, col, num_rows, nullable, Int8Builder, i8)
+            }
+            DataType::Int16 => {
+                build_primitive_col!(data, offsets, col, num_rows, nullable, Int16Builder, i16)
+            }
+            DataType::Int32 => {
+                build_primitive_col!(data, offsets, col, num_rows, nullable, Int32Builder, i32)
+            }
+            DataType::Int64 => {
+                build_primitive_col!(data, offsets, col, num_rows, nullable, Int64Builder, i64)
+            }
+            DataType::UInt8 => {
+                build_primitive_col!(data, offsets, col, num_rows, nullable, UInt8Builder, u8)
+            }
             DataType::UInt16 => {
-                build_primitive!(self, col, num_rows, nullable, UInt16Builder, u16)
+                build_primitive_col!(data, offsets, col, num_rows, nullable, UInt16Builder, u16)
             }
             DataType::UInt32 => {
-                build_primitive!(self, col, num_rows, nullable, UInt32Builder, u32)
+                build_primitive_col!(data, offsets, col, num_rows, nullable, UInt32Builder, u32)
             }
             DataType::UInt64 => {
-                build_primitive!(self, col, num_rows, nullable, UInt64Builder, u64)
+                build_primitive_col!(data, offsets, col, num_rows, nullable, UInt64Builder, u64)
             }
             DataType::Float32 => {
-                build_primitive!(self, col, num_rows, nullable, Float32Builder, f32)
+                build_primitive_col!(data, offsets, col, num_rows, nullable, Float32Builder, f32)
             }
             DataType::Float64 => {
-                build_primitive!(self, col, num_rows, nullable, Float64Builder, f64)
+                build_primitive_col!(data, offsets, col, num_rows, nullable, Float64Builder, f64)
             }
             other => Err(ArrowError::NotYetImplemented(format!(
                 "data type {other} not yet supported"
@@ -341,35 +353,43 @@ impl Decoder {
         }
     }
 
-    fn push_field_from_cache(&mut self, start: usize, end: usize) {
+    fn push_field_to_column(&mut self, col: usize, start: usize, end: usize) {
         let raw = &self.cached_buf[start..end];
+        let col_data = &mut self.col_data[col];
         if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' {
             let inner = &self.cached_buf[start + 1..end - 1];
             let mut i = 0;
             while i < inner.len() {
                 if inner[i] == b'"' && inner.get(i + 1) == Some(&b'"') {
-                    self.field_data.push(b'"');
+                    col_data.push(b'"');
                     i += 2;
                 } else {
-                    self.field_data.push(inner[i]);
+                    col_data.push(inner[i]);
                     i += 1;
                 }
             }
         } else {
-            self.field_data.extend_from_slice(raw);
+            col_data.extend_from_slice(raw);
         }
-        self.field_offsets.push(self.field_data.len());
+        self.col_offsets[col].push(self.col_data[col].len());
     }
 }
 
-macro_rules! build_primitive {
-    ($self:expr, $col:expr, $num_rows:expr, $nullable:expr, $builder:ty, $native:ty) => {{
+macro_rules! build_primitive_col {
+    ($data:expr, $offsets:expr, $col:expr, $num_rows:expr, $nullable:expr, $builder:ty, $native:ty) => {{
         let mut b = <$builder>::with_capacity($num_rows);
         for row in 0..$num_rows {
-            let s = $self.get_field_str(row, $col)?;
-            if s.is_empty() && $nullable {
+            let raw = &$data[$offsets[row]..$offsets[row + 1]];
+            if raw.is_empty() && $nullable {
                 b.append_null();
             } else {
+                let s = std::str::from_utf8(raw).map_err(|e| {
+                    ArrowError::ParseError(format!(
+                        "invalid utf-8 at row {}, col {}: {}",
+                        row, $col, e
+                    ))
+                })?;
+
                 let v: $native = s.parse().map_err(|_| {
                     ArrowError::ParseError(format!(
                         "cannot parse '{}' as {} at row {}, col {}",
@@ -385,7 +405,7 @@ macro_rules! build_primitive {
         Ok(Arc::new(b.finish()) as ArrayRef)
     }};
 }
-use build_primitive;
+use build_primitive_col;
 
 #[inline(always)]
 fn classify_one(chunk: &[u8], high_nibbles: u8x16, low_nibbles: u8x16) -> u8x16 {
