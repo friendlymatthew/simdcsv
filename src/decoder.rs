@@ -60,6 +60,10 @@ impl Decoder {
         }
     }
 
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
     pub fn decode(&mut self, buf: &[u8]) -> Result<usize, ArrowError> {
         if buf.is_empty() || self.capacity() == 0 {
             return Ok(0);

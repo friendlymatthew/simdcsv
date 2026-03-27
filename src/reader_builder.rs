@@ -1,6 +1,9 @@
+use std::io::{BufRead, Read};
+
 use arrow_schema::SchemaRef;
 
 use crate::Decoder;
+use crate::reader;
 
 #[derive(Debug)]
 pub struct ReaderBuilder {
@@ -36,6 +39,14 @@ impl ReaderBuilder {
     pub const fn with_delimiter(mut self, delimiter: u8) -> Self {
         self.delimiter = delimiter;
         self
+    }
+
+    pub fn build<R: Read>(self, reader: R) -> reader::Reader<R> {
+        self.build_buffered(std::io::BufReader::new(reader))
+    }
+
+    pub fn build_buffered<R: BufRead>(self, reader: R) -> reader::BufReader<R> {
+        reader::BufReader::new(reader, self.build_decoder())
     }
 
     pub fn build_decoder(self) -> Decoder {

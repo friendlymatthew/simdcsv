@@ -5,8 +5,10 @@ use arrow_schema::{DataType, Field, Schema};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).expect("expect .csv file path");
-    let raw = std::fs::read(path)?;
+    let file = std::fs::File::open(&path)?;
 
+    // peek at the first line to count columns
+    let raw = std::fs::read(&path)?;
     let num_columns = raw
         .iter()
         .position(|&b| b == b'\n')
@@ -19,22 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect::<Vec<_>>(),
     ));
 
-    let mut decoder = ReaderBuilder::new(schema)
-        .with_batch_size(8192)
-        .build_decoder();
+    let reader = ReaderBuilder::new(schema).with_batch_size(8192).build(file);
 
-    let mut offset = 0;
-    loop {
-        let consumed = decoder.decode(&raw[offset..])?;
-        offset += consumed;
-        if consumed == 0 || decoder.capacity() == 0 {
-            if let Some(batch) = decoder.flush()? {
-                std::hint::black_box(batch.num_rows());
-            }
-            if consumed == 0 && decoder.capacity() > 0 {
-                break;
-            }
-        }
+    for batch in reader {
+        let _batch = batch?;
     }
 
     Ok(())

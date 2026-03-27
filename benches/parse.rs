@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use arrow_csv2::{ReaderBuilder, read};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{Criterion, criterion_group, criterion_main};
 
@@ -15,19 +14,13 @@ fn clickbench_schema() -> Arc<Schema> {
 
 fn bench_clickbench(c: &mut Criterion) {
     let raw = std::fs::read("hits_100mb.csv")
-        .expect("hits_100mb.csv not found — run: cargo run --release --bin slice_clickbench");
-    let schema = clickbench_schema();
+        .expect("hits_100mb.csv not found, run: cargo run --release --bin slice_clickbench");
 
-    // c.bench_function("arrow-csv2::read (clickbench 100MB)", |b| {
-    //     b.iter(|| {
-    //         let mut data = raw.clone();
-    //         read(&mut data)
-    //     });
-    // });
+    let schema = clickbench_schema();
 
     c.bench_function("arrow-csv2::Decoder (clickbench 100MB)", |b| {
         b.iter(|| {
-            let mut decoder = ReaderBuilder::new(schema.clone())
+            let mut decoder = arrow_csv2::ReaderBuilder::new(schema.clone())
                 .with_batch_size(8192)
                 .build_decoder();
 
@@ -49,27 +42,24 @@ fn bench_clickbench(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("arrow-csv::Decoder (clickbench 100MB)", |b| {
+    c.bench_function("arrow-csv2::Reader (clickbench 100MB)", |b| {
         b.iter(|| {
-            let mut decoder = arrow_csv::ReaderBuilder::new(schema.clone())
+            let reader = arrow_csv2::ReaderBuilder::new(schema.clone())
                 .with_batch_size(8192)
-                .build_decoder();
+                .build_buffered(raw.as_slice());
 
-            let mut offset = 0;
-            let mut batches = Vec::new();
-            loop {
-                let consumed = decoder.decode(&raw[offset..]).unwrap();
-                offset += consumed;
-                if consumed == 0 || decoder.capacity() == 0 {
-                    if let Some(batch) = decoder.flush().unwrap() {
-                        batches.push(batch);
-                    }
-                    if consumed == 0 {
-                        break;
-                    }
-                }
-            }
-            batches
+            reader.collect::<Result<Vec<_>, _>>().unwrap()
+        });
+    });
+
+    c.bench_function("arrow-csv::Reader (clickbench 100MB)", |b| {
+        b.iter(|| {
+            let reader = arrow_csv::ReaderBuilder::new(schema.clone())
+                .with_batch_size(8192)
+                .build_buffered(raw.as_slice())
+                .unwrap();
+
+            reader.collect::<Result<Vec<_>, _>>().unwrap()
         });
     });
 }
