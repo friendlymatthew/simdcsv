@@ -7,7 +7,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).expect("expect .csv file path");
     let file = std::fs::File::open(&path)?;
 
-    // peek at the first line to count columns
     let raw = std::fs::read(&path)?;
     let num_columns = raw
         .iter()
@@ -23,9 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let reader = ReaderBuilder::new(schema).with_batch_size(8192).build(file);
 
-    for batch in reader {
-        let _batch = batch?;
-    }
+    let _ = reader.collect::<Result<Vec<_>, _>>()?;
 
     Ok(())
 }

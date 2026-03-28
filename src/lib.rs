@@ -2,6 +2,7 @@
 
 mod arrow;
 mod classify;
+pub mod clickbench;
 mod decoder;
 mod reader;
 mod reader_builder;

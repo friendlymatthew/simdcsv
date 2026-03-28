@@ -55,12 +55,16 @@ impl Decoder {
     }
 
     pub fn decode(&mut self, buf: &[u8]) -> Result<usize, ArrowError> {
-        if buf.is_empty() || self.capacity() == 0 {
+        if self.capacity() == 0 {
             return Ok(0);
         }
 
         if !self.cached_buf.is_empty() {
             return self.extract_from_cache();
+        }
+
+        if buf.is_empty() {
+            return Ok(0);
         }
 
         self.cached_buf.clear();

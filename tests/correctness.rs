@@ -13,7 +13,7 @@ fn taxi_zone_schema() -> Arc<Schema> {
 }
 
 #[test]
-fn arrow_csv2_matches_arrow_csv() {
+fn taxi_zone_matches_arrow_csv() {
     let raw = std::fs::read("taxi_zone_lookup.csv").expect("missing csv");
     let schema = taxi_zone_schema();
 
@@ -32,27 +32,38 @@ fn arrow_csv2_matches_arrow_csv() {
         .map(|r| r.unwrap())
         .collect::<Vec<_>>();
 
-    assert_eq!(ours.len(), theirs.len(), "batch count mismatch");
+    assert_eq!(ours.len(), theirs.len());
 
     for (a, b) in ours.iter().zip(&theirs) {
-        assert_eq!(a.num_rows(), b.num_rows(),);
-        assert_eq!(a.num_columns(), b.num_columns(),);
+        assert_eq!(a, b);
+    }
+}
 
-        for col in 0..a.num_columns() {
-            let col_a = a
-                .column(col)
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-                .unwrap();
-            let col_b = b
-                .column(col)
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-                .unwrap();
+#[test]
+fn clickbench_matches_arrow_csv() {
+    let Ok(raw) = std::fs::read("hits_100mb.csv") else {
+        eprintln!("skipping clickbench test: hits_100mb.csv not found");
+        return;
+    };
+    let schema = arrow_csv2::clickbench::schema();
 
-            for row in 0..a.num_rows() {
-                assert_eq!(col_a.value(row), col_b.value(row),);
-            }
-        }
+    let ours = ReaderBuilder::new(schema.clone())
+        .with_batch_size(8192)
+        .build(raw.as_slice())
+        .map(|r| r.unwrap())
+        .collect::<Vec<_>>();
+
+    let theirs = arrow_csv::ReaderBuilder::new(schema)
+        .with_batch_size(8192)
+        .build(raw.as_slice())
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ours.len(), theirs.len());
+
+    for (a, b) in ours.iter().zip(&theirs) {
+        assert_eq!(a.num_rows(), b.num_rows());
+        assert_eq!(a, b);
     }
 }

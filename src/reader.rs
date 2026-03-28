@@ -36,13 +36,14 @@ impl<R: BufRead> BufReader<R> {
     fn read(&mut self) -> Result<Option<RecordBatch>, ArrowError> {
         loop {
             if self.exhausted {
+                self.decoder.decode(&[])?;
                 return self.decoder.flush();
             }
 
             let buf = self.reader.fill_buf()?;
             if buf.is_empty() {
                 self.exhausted = true;
-                return self.decoder.flush();
+                continue;
             }
 
             if self.remainder.is_empty() {
