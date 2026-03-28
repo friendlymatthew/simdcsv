@@ -2,8 +2,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SchemaRef};
 
 use crate::arrow::build_column;
-use crate::classify::{COMMA, HIGH_NIBBLES, LOW_NIBBLES, NEWLINE, QUOTES};
-use crate::u8x16;
+use crate::classify::classify_and_mask;
 
 #[derive(Debug)]
 pub struct Decoder {
@@ -60,56 +59,20 @@ impl Decoder {
             return Ok(0);
         }
 
-        // if we have cached bitsets from a previous scan, continue extracting from them
         if !self.cached_buf.is_empty() {
             return self.extract_from_cache();
         }
 
         self.cached_buf.clear();
         self.cached_buf.extend_from_slice(buf);
-
         let original_len = self.cached_buf.len();
         self.cached_buf.resize(original_len.next_multiple_of(64), 0);
 
-        // phase 1+2: classify and build bitsets in one pass
-        let low_nibbles = u8x16::from_slice_unchecked(&LOW_NIBBLES);
-        let high_nibbles = u8x16::from_slice_unchecked(&HIGH_NIBBLES);
-        let comma_bc = u8x16::broadcast(COMMA);
-        let newline_bc = u8x16::broadcast(NEWLINE);
-        let quote_bc = u8x16::broadcast(QUOTES);
+        let result = classify_and_mask(&self.cached_buf);
 
-        let cap = self.cached_buf.len() / 64;
-        let mut comma_bitsets = Vec::with_capacity(cap);
-        let mut newline_bitsets = Vec::with_capacity(cap);
-        let mut quote_bitsets = Vec::with_capacity(cap);
-
-        for chunk in self.cached_buf.chunks_exact(64) {
-            let v0 = classify_one(&chunk[0..16], high_nibbles, low_nibbles);
-            let v1 = classify_one(&chunk[16..32], high_nibbles, low_nibbles);
-            let v2 = classify_one(&chunk[32..48], high_nibbles, low_nibbles);
-            let v3 = classify_one(&chunk[48..64], high_nibbles, low_nibbles);
-
-            comma_bitsets.push(build_u64_from_classified(v0, v1, v2, v3, comma_bc));
-            newline_bitsets.push(build_u64_from_classified(v0, v1, v2, v3, newline_bc));
-            quote_bitsets.push(build_u64_from_classified(v0, v1, v2, v3, quote_bc));
-        }
-
-        // phase 3: quote mask
-        let mut carry = false;
-        for i in 0..quote_bitsets.len() {
-            let bitset = quote_bitsets[i];
-            let inside =
-                unsafe { std::arch::aarch64::vmull_p64(bitset, 0xFFFFFFFFFFFFFFFF_u64) } as u64;
-            let outside = if carry { inside } else { !inside };
-            carry ^= (bitset.count_ones() & 1) != 0;
-            comma_bitsets[i] &= outside;
-            newline_bitsets[i] &= outside;
-        }
-
-        // cache bitsets and initialize iterator state
         self.cached_buf.truncate(original_len);
-        self.cached_comma_bitsets = comma_bitsets;
-        self.cached_newline_bitsets = newline_bitsets;
+        self.cached_comma_bitsets = result.comma_bitsets;
+        self.cached_newline_bitsets = result.newline_bitsets;
         self.comma_current = self.cached_comma_bitsets.first().copied().unwrap_or(0);
         self.comma_idx = 0;
         self.newline_current = self.cached_newline_bitsets.first().copied().unwrap_or(0);
@@ -117,29 +80,10 @@ impl Decoder {
         self.cached_start = 0;
         self.cached_bytes_consumed = 0;
 
-        // skip header
         if !self.header_skipped {
             if let Some(nl_pos) = self.next_newline() {
-                if self.cached_buf[nl_pos] == b'\r'
-                    && self.cached_buf.get(nl_pos + 1) == Some(&b'\n')
-                {
-                    self.cached_start = nl_pos + 2;
-                    // skip the \n that follows \r
-                    if self.peek_newline() == Some(nl_pos + 1) {
-                        self.next_newline();
-                    }
-                } else {
-                    self.cached_start = nl_pos + 1;
-                }
-
-                loop {
-                    match self.peek_comma() {
-                        Some(pos) if pos < self.cached_start => {
-                            self.next_comma();
-                        }
-                        _ => break,
-                    }
-                }
+                self.skip_crlf(nl_pos);
+                self.advance_commas_past(self.cached_start);
                 self.cached_bytes_consumed = self.cached_start;
                 self.header_skipped = true;
             } else {
@@ -155,47 +99,64 @@ impl Decoder {
         let rows_to_read = self.capacity();
         let mut rows_read = 0;
         let cols = self.num_columns;
+        let mut exhausted = false;
 
         while rows_read < rows_to_read {
             let nl_pos = match self.next_newline() {
                 Some(pos) => pos,
-                None => break,
+                None => {
+                    exhausted = true;
+                    break;
+                }
             };
 
             for col in 0..cols.saturating_sub(1) {
                 if let Some(end) = self.next_comma() {
                     let start = self.cached_start;
-                    self.push_field_to_column(col, start, end);
+                    self.push_field(col, start, end);
                     self.cached_start = end + 1;
                 }
             }
 
             let start = self.cached_start;
-            self.push_field_to_column(cols - 1, start, nl_pos);
-
-            if self.cached_buf[nl_pos] == b'\r' && self.cached_buf.get(nl_pos + 1) == Some(&b'\n') {
-                self.cached_start = nl_pos + 2;
-                if self.peek_newline() == Some(nl_pos + 1) {
-                    self.next_newline();
-                }
-            } else {
-                self.cached_start = nl_pos + 1;
-            }
+            self.push_field(cols - 1, start, nl_pos);
+            self.skip_crlf(nl_pos);
 
             self.num_rows += 1;
             rows_read += 1;
             self.cached_bytes_consumed = self.cached_start;
         }
 
-        // if we've consumed all cached newlines, return bytes consumed and clear cache
-        if self.peek_newline().is_none() {
+        if exhausted {
             let consumed = self.cached_bytes_consumed;
             self.clear_cache();
-            return Ok(consumed);
+            Ok(consumed)
+        } else {
+            Ok(0)
         }
+    }
 
-        // still have cached data — return 0 to signal "flush then call decode again"
-        Ok(0)
+    fn skip_crlf(&mut self, nl_pos: usize) {
+        if self.cached_buf[nl_pos] == b'\r' && self.cached_buf.get(nl_pos + 1) == Some(&b'\n') {
+            self.cached_start = nl_pos + 2;
+            let lf_pos = nl_pos + 1;
+            let word = lf_pos / 64;
+            let bit = lf_pos % 64;
+            let mask = !(1u64 << bit);
+            self.cached_newline_bitsets[word] &= mask;
+            let same = (word == self.newline_idx) as u64;
+            self.newline_current &= mask | !same.wrapping_neg();
+        } else {
+            self.cached_start = nl_pos + 1;
+        }
+    }
+
+    fn advance_commas_past(&mut self, pos: usize) {
+        let word = pos / 64;
+        let bit = pos % 64;
+        self.comma_idx = word;
+        self.comma_current = self.cached_comma_bitsets.get(word).copied().unwrap_or(0)
+            & !((1u64 << bit).wrapping_sub(1));
     }
 
     #[inline(always)]
@@ -208,28 +169,10 @@ impl Decoder {
     }
 
     #[inline(always)]
-    fn peek_comma(&self) -> Option<usize> {
-        peek_bit(
-            self.comma_current,
-            self.comma_idx,
-            &self.cached_comma_bitsets,
-        )
-    }
-
-    #[inline(always)]
     fn next_newline(&mut self) -> Option<usize> {
         next_bit(
             &mut self.newline_current,
             &mut self.newline_idx,
-            &self.cached_newline_bitsets,
-        )
-    }
-
-    #[inline(always)]
-    fn peek_newline(&self) -> Option<usize> {
-        peek_bit(
-            self.newline_current,
-            self.newline_idx,
             &self.cached_newline_bitsets,
         )
     }
@@ -257,6 +200,7 @@ impl Decoder {
             .map(|col| {
                 let data = std::mem::take(&mut self.col_data[col]);
                 let offsets = std::mem::take(&mut self.col_offsets[col]);
+
                 build_column(self.schema.field(col), data, offsets, col, num_rows)
             })
             .collect::<Result<Vec<_>, ArrowError>>()?;
@@ -274,7 +218,7 @@ impl Decoder {
         self.batch_size - self.num_rows
     }
 
-    fn push_field_to_column(&mut self, col: usize, start: usize, end: usize) {
+    fn push_field(&mut self, col: usize, start: usize, end: usize) {
         let raw = &self.cached_buf[start..end];
         let col_data = &mut self.col_data[col];
         if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' {
@@ -297,22 +241,6 @@ impl Decoder {
 }
 
 #[inline(always)]
-fn classify_one(chunk: &[u8], high_nibbles: u8x16, low_nibbles: u8x16) -> u8x16 {
-    let v = u8x16::from_slice_unchecked(chunk);
-    let (high, low) = v.nibbles();
-    high_nibbles.classify(high) & low_nibbles.classify(low)
-}
-
-#[inline(always)]
-fn build_u64_from_classified(v0: u8x16, v1: u8x16, v2: u8x16, v3: u8x16, broadcast: u8x16) -> u64 {
-    let a = v0.eq(broadcast).bitset() as u64;
-    let b = v1.eq(broadcast).bitset() as u64;
-    let c = v2.eq(broadcast).bitset() as u64;
-    let d = v3.eq(broadcast).bitset() as u64;
-    a | (b << 16) | (c << 32) | (d << 48)
-}
-
-#[inline(always)]
 fn next_bit(current: &mut u64, idx: &mut usize, bitsets: &[u64]) -> Option<usize> {
     while *current == 0 {
         *idx += 1;
@@ -325,28 +253,9 @@ fn next_bit(current: &mut u64, idx: &mut usize, bitsets: &[u64]) -> Option<usize
     }
 
     let pos = current.trailing_zeros() as usize;
-
     *current &= *current - 1;
 
     Some(*idx * 64 + pos)
-}
-
-#[inline(always)]
-fn peek_bit(current: u64, idx: usize, bitsets: &[u64]) -> Option<usize> {
-    let mut current = current;
-    let mut idx = idx;
-
-    while current == 0 {
-        idx += 1;
-
-        if idx >= bitsets.len() {
-            return None;
-        }
-
-        current = unsafe { *bitsets.get_unchecked(idx) };
-    }
-
-    Some(idx * 64 + current.trailing_zeros() as usize)
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ fn clickbench_schema() -> Arc<Schema> {
         let nullable = matches!(dt, Utf8);
         Field::new(name, dt, nullable)
     };
+
     Arc::new(Schema::new(vec![
         f("WatchID", Int64),
         f("JavaEnable", Int16),
@@ -123,30 +124,6 @@ fn bench_clickbench(c: &mut Criterion) {
         .expect("hits_100mb.csv not found, run: cargo run --release --bin slice_clickbench");
 
     let schema = clickbench_schema();
-
-    c.bench_function("arrow-csv2::Decoder (clickbench 100MB)", |b| {
-        b.iter(|| {
-            let mut decoder = arrow_csv2::ReaderBuilder::new(schema.clone())
-                .with_batch_size(8192)
-                .build_decoder();
-
-            let mut offset = 0;
-            let mut batches = Vec::new();
-            loop {
-                let consumed = decoder.decode(&raw[offset..]).unwrap();
-                offset += consumed;
-                if consumed == 0 || decoder.capacity() == 0 {
-                    if let Some(batch) = decoder.flush().unwrap() {
-                        batches.push(batch);
-                    }
-                    if consumed == 0 && decoder.capacity() > 0 {
-                        break;
-                    }
-                }
-            }
-            batches
-        });
-    });
 
     c.bench_function("arrow-csv2::Reader (clickbench 100MB)", |b| {
         b.iter(|| {

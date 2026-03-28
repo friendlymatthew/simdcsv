@@ -22,45 +22,75 @@ pub const HIGH_NIBBLES: [u8; 16] = {
     out
 };
 
-// note: data must be a multiple of 16
-pub fn classify(data: &[u8]) -> Vec<u8x16> {
-    let low_nibbles = u8x16::from_slice_unchecked(&LOW_NIBBLES);
-    let high_nibbles = u8x16::from_slice_unchecked(&HIGH_NIBBLES);
-
-    let chunks = data.chunks_exact(u8x16::LANE_COUNT);
-
-    let mut out = Vec::with_capacity(data.len() / 16);
-
-    for chunk in chunks {
-        let v = u8x16::from_slice_unchecked(chunk);
-        let (high, low) = v.nibbles();
-
-        let res = high_nibbles.classify(high) & low_nibbles.classify(low);
-        out.push(res);
-    }
-
-    out
+pub struct ClassifyResult {
+    pub comma_bitsets: Vec<u64>,
+    pub newline_bitsets: Vec<u64>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// classify structual characters and apply quote masking
+// note: data must be a multiple of 64 bytes
+pub fn classify_and_mask(data: &[u8]) -> ClassifyResult {
+    let low_nib = u8x16::from_slice_unchecked(&LOW_NIBBLES);
+    let high_nib = u8x16::from_slice_unchecked(&HIGH_NIBBLES);
+    let comma_bc = u8x16::broadcast(COMMA);
+    let newline_bc = u8x16::broadcast(NEWLINE);
+    let quote_bc = u8x16::broadcast(QUOTES);
 
-    #[test]
-    fn test_basic_classify() {
-        let mut data = b"a,b,c\nf,\"g\"".to_vec();
-        data.resize(data.len().next_multiple_of(16), 0);
+    let num_words = data.len() / 64;
+    let mut comma_bitsets = Vec::with_capacity(num_words);
+    let mut newline_bitsets = Vec::with_capacity(num_words);
 
-        let bitsets = classify(&data);
+    let mut carry = false;
+    for chunk in data.chunks_exact(64) {
+        let (c0, c1, c2, c3) = classify_four_lanes(chunk, high_nib, low_nib);
 
-        assert_eq!(bitsets.len(), 1);
-        let res: [u8; 16] = bitsets[0].into();
+        let mut comma = build_eq_bitset(c0, c1, c2, c3, comma_bc);
+        let mut newline = build_eq_bitset(c0, c1, c2, c3, newline_bc);
+        let quote = build_eq_bitset(c0, c1, c2, c3, quote_bc);
 
-        assert_eq!(
-            res,
-            [
-                0, COMMA, 0, COMMA, 0, NEWLINE, 0, COMMA, QUOTES, 0, QUOTES, 0, 0, 0, 0, 0,
-            ]
-        );
+        let inside = unsafe { std::arch::aarch64::vmull_p64(quote, 0xFFFFFFFFFFFFFFFF_u64) } as u64;
+        let outside = if carry { inside } else { !inside };
+        carry ^= (quote.count_ones() & 1) != 0;
+
+        comma &= outside;
+        newline &= outside;
+
+        comma_bitsets.push(comma);
+        newline_bitsets.push(newline);
     }
+
+    ClassifyResult {
+        comma_bitsets,
+        newline_bitsets,
+    }
+}
+
+#[inline(always)]
+fn classify_four_lanes(
+    chunk: &[u8],
+    high_nib: u8x16,
+    low_nib: u8x16,
+) -> (u8x16, u8x16, u8x16, u8x16) {
+    let classify_one = |slice: &[u8]| {
+        let v = u8x16::from_slice_unchecked(slice);
+        let (h, l) = v.nibbles();
+        high_nib.classify(h) & low_nib.classify(l)
+    };
+
+    (
+        classify_one(&chunk[0..16]),
+        classify_one(&chunk[16..32]),
+        classify_one(&chunk[32..48]),
+        classify_one(&chunk[48..64]),
+    )
+}
+
+#[inline(always)]
+fn build_eq_bitset(v0: u8x16, v1: u8x16, v2: u8x16, v3: u8x16, bc: u8x16) -> u64 {
+    let a = v0.eq(bc).bitset() as u64;
+    let b = v1.eq(bc).bitset() as u64;
+    let c = v2.eq(bc).bitset() as u64;
+    let d = v3.eq(bc).bitset() as u64;
+
+    a | (b << 16) | (c << 32) | (d << 48)
 }
