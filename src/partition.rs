@@ -211,7 +211,7 @@ impl PartitionResolver {
     }
 }
 
-fn find_first_set_bit(bitsets: &[u64]) -> Option<usize> {
+pub fn find_first_set_bit(bitsets: &[u64]) -> Option<usize> {
     bitsets
         .iter()
         .enumerate()
