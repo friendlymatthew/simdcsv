@@ -36,6 +36,10 @@ name = "check_github_issues"
 path = "bin/check_github_issues.rs"
 
 
+[[bin]]
+name = "parse_hits"
+path = "bin/parse_hits.rs"
+
 [[bench]]
 name = "parallel"
 harness = false
