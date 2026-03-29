@@ -41,10 +41,7 @@ fn taxi_zone_matches_arrow_csv() {
 
 #[test]
 fn clickbench_matches_arrow_csv() {
-    let Ok(raw) = std::fs::read("hits_100mb.csv") else {
-        eprintln!("skipping clickbench test: hits_100mb.csv not found");
-        return;
-    };
+    let raw = std::fs::read("hits_100mb.csv").unwrap();
     let schema = arrow_csv2::clickbench::schema();
 
     let ours = ReaderBuilder::new(schema.clone())

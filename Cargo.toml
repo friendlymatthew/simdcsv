@@ -4,32 +4,40 @@ authors = ["Matthew Kim"]
 version = "0.1.0"
 edition = "2024"
 description = "A CSV parser"
-default-run = "arrow-csv2"
+# default-run = "arrow-csv2"
 license = "Apache 2.0"
 
 [dependencies]
-arrow-schema = "55"
-arrow-array = "55"
-arrow-buffer = "55"
-arrow-cast = "55"
+arrow-schema = "58"
+arrow-array = "58"
+arrow-buffer = "58"
+arrow-cast = "58"
 simdutf8 = "0.1.5"
 atoi = "2.0.0"
+datafusion = { version = "53", default-features = false }
+datafusion-datasource = "53"
+object_store = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+futures = "0.3"
+tokio-stream = "0.1"
+arrow-csv = "58"
+duckdb = { version = "1.10501", features = ["bundled"] }
 
 [dev-dependencies]
 insta = "1.46.3"
-criterion = "0.8.2"
-arrow-csv = "55"
+criterion = { version = "0.8.2", features = ["async", "async_tokio"] }
 
 [[bin]]
 name = "slice_clickbench"
 path = "bin/slice_clickbench.rs"
 
 [[bin]]
-name = "parse_hits_100"
-path = "bin/parse_hits_100.rs"
+name = "check_github_issues"
+path = "bin/check_github_issues.rs"
+
 
 [[bench]]
-name = "parse"
+name = "parallel"
 harness = false
 
 [profile.release]

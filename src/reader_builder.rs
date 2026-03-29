@@ -2,7 +2,9 @@ use std::io::{BufRead, Read};
 
 use arrow_schema::SchemaRef;
 
+use crate::BufReader;
 use crate::Decoder;
+use crate::Reader;
 use crate::reader;
 
 #[derive(Debug)]
@@ -41,11 +43,11 @@ impl ReaderBuilder {
         self
     }
 
-    pub fn build<R: Read>(self, reader: R) -> reader::Reader<R> {
+    pub fn build<R: Read>(self, reader: R) -> Reader<R> {
         self.build_buffered(std::io::BufReader::new(reader))
     }
 
-    pub fn build_buffered<R: BufRead>(self, reader: R) -> reader::BufReader<R> {
+    pub fn build_buffered<R: BufRead>(self, reader: R) -> BufReader<R> {
         reader::BufReader::new(reader, self.build_decoder())
     }
 

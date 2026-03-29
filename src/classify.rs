@@ -1,4 +1,4 @@
-use crate::u8x16;
+use crate::simd::u8x16;
 
 pub const COMMA: u8 = 1;
 pub const NEWLINE: u8 = 2;
@@ -42,6 +42,7 @@ pub fn classify_and_mask(data: &[u8]) -> ClassifyResult {
 
     let mut carry = false;
     for chunk in data.chunks_exact(64) {
+        let chunk: &[u8; 64] = chunk.try_into().unwrap();
         let (c0, c1, c2, c3) = classify_four_lanes(chunk, high_nib, low_nib);
 
         let mut comma = build_eq_bitset(c0, c1, c2, c3, comma_bc);
@@ -66,8 +67,8 @@ pub fn classify_and_mask(data: &[u8]) -> ClassifyResult {
 }
 
 #[inline(always)]
-fn classify_four_lanes(
-    chunk: &[u8],
+pub fn classify_four_lanes(
+    chunk: &[u8; 64],
     high_nib: u8x16,
     low_nib: u8x16,
 ) -> (u8x16, u8x16, u8x16, u8x16) {
@@ -86,7 +87,7 @@ fn classify_four_lanes(
 }
 
 #[inline(always)]
-fn build_eq_bitset(v0: u8x16, v1: u8x16, v2: u8x16, v3: u8x16, bc: u8x16) -> u64 {
+pub fn build_eq_bitset(v0: u8x16, v1: u8x16, v2: u8x16, v3: u8x16, bc: u8x16) -> u64 {
     let a = v0.eq(bc).bitset() as u64;
     let b = v1.eq(bc).bitset() as u64;
     let c = v2.eq(bc).bitset() as u64;

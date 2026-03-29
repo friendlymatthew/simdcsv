@@ -1,6 +1,6 @@
 use std::arch::aarch64::{
-    uint8x16_t, vandq_u8, vceqq_u8, vdupq_n_u8, vgetq_lane_u8, vld1q_u8, vpaddq_u8, vqtbl1q_u8,
-    vshrq_n_u8, vst1q_u8,
+    uint8x16_t, vaddvq_u8, vandq_u8, vceqq_u8, vdupq_n_u8, vgetq_lane_u8, vld1q_u8, vpaddq_u8,
+    vqtbl1q_u8, vshrq_n_u8, vst1q_u8,
 };
 use std::fmt::{Debug, Formatter};
 use std::ops::BitAnd;
@@ -41,6 +41,13 @@ impl u8x16 {
 
     pub fn eq(&self, other: Self) -> Self {
         unsafe { vceqq_u8(self.0, other.0) }.into()
+    }
+
+    pub fn count_ones(self) -> u32 {
+        unsafe {
+            let ones = vshrq_n_u8::<7>(self.0);
+            vaddvq_u8(ones) as u32
+        }
     }
 
     pub fn bitset(self) -> u16 {

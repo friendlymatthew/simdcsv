@@ -2,3 +2,5 @@
 hits.csv
 hits_100mb.csv
 profile.json.gz
+github_issues.csv
+adversarial.csv
