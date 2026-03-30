@@ -22,11 +22,11 @@ bytes = "1"
 futures = "0.3"
 tokio-stream = "0.1"
 arrow-csv = "58"
-duckdb = { version = "1.10501", features = ["bundled"] }
 
 [dev-dependencies]
 insta = "1.46.3"
 criterion = { version = "0.8.2", features = ["async", "async_tokio"] }
+duckdb = { version = "1.10501", features = ["bundled"] }
 
 [[bin]]
 name = "slice_clickbench"
@@ -43,6 +43,6 @@ harness = false
 
 [profile.release]
 debug = 2
-# lto = "fat"
+lto = "fat"
 panic = "abort"
 codegen-units = 1

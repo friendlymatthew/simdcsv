@@ -21,6 +21,11 @@ jobs:
       - name: version info
         run: rustc --version; cargo --version;
 
+      - name: Download test data
+        run: gh release download test-data --pattern "hits_100mb.csv" --repo friendlymatthew/arrow-csv2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Run all tests
         run: cargo test
 
