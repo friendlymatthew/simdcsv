@@ -18,6 +18,7 @@ datafusion = { version = "53", default-features = false }
 datafusion-datasource = "53"
 object_store = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+bytes = "1"
 futures = "0.3"
 tokio-stream = "0.1"
 arrow-csv = "58"
@@ -31,14 +32,10 @@ criterion = { version = "0.8.2", features = ["async", "async_tokio"] }
 name = "slice_clickbench"
 path = "bin/slice_clickbench.rs"
 
-[[bin]]
-name = "check_github_issues"
-path = "bin/check_github_issues.rs"
-
 
 [[bin]]
-name = "parse_hits"
-path = "bin/parse_hits.rs"
+name = "parse_clickbench"
+path = "bin/parse_clickbench.rs"
 
 [[bench]]
 name = "parallel"

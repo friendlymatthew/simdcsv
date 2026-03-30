@@ -3,8 +3,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arrow_array::RecordBatch;
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_schema::SchemaRef;
 use datafusion::common::Result as DatafusionResult;
 use datafusion::datasource::physical_plan::{FileOpenFuture, FileOpener};
 use datafusion::error::DataFusionError;
@@ -15,93 +14,65 @@ use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::{PartitionedFile, TableSchema};
 use futures::StreamExt;
 use object_store::{GetOptions, ObjectStore, path::Path as ObjectPath};
-use tokio::sync::{Barrier, OnceCell};
+use tokio::sync::{Notify, OnceCell, Semaphore, oneshot};
 
 use crate::ReaderBuilder;
-use crate::monoid::ClassifyResult;
-use crate::partition::{PartitionResolver, ResolvedSplit, SubPartition};
+use crate::partition::{PartitionClassifier, PartitionResolver, RecordAlignedRange};
 
-pub trait CsvDecoder: Send + Sync + 'static {
-    fn decode(
-        &self,
-        schema: SchemaRef,
-        batch_size: usize,
-        data: &[u8],
-    ) -> Result<Vec<RecordBatch>, ArrowError>;
-}
-
-#[derive(Clone)]
-pub struct ArrowCsvDecoder;
-
-impl CsvDecoder for ArrowCsvDecoder {
-    fn decode(
-        &self,
-        schema: SchemaRef,
-        batch_size: usize,
-        data: &[u8],
-    ) -> Result<Vec<RecordBatch>, ArrowError> {
-        let reader = arrow_csv::ReaderBuilder::new(schema)
-            .with_batch_size(batch_size)
-            .build_buffered(data)?;
-
-        reader.collect()
-    }
-}
-
-#[derive(Clone)]
-pub struct ArrowCsv2Decoder;
-
-impl CsvDecoder for ArrowCsv2Decoder {
-    fn decode(
-        &self,
-        schema: SchemaRef,
-        batch_size: usize,
-        data: &[u8],
-    ) -> Result<Vec<RecordBatch>, ArrowError> {
-        let reader = ReaderBuilder::new(schema)
-            .with_batch_size(batch_size)
-            .build_buffered(data);
-
-        reader.collect()
-    }
-}
+type Payload = Result<
+    (bytes::Bytes, tokio::sync::OwnedSemaphorePermit),
+    Box<dyn std::error::Error + Send + Sync>,
+>;
 
 struct SharedState {
-    coordinator: Mutex<PartitionResolver>,
-    barrier: Barrier,
-    resolved: OnceCell<Vec<ResolvedSplit>>,
+    resolver: Mutex<PartitionResolver>,
+    partition_ready: Box<[Notify]>,
+    record_aligned_ranges: Box<[OnceCell<RecordAlignedRange>]>,
+    semaphore: Arc<Semaphore>,
     next_partition: AtomicUsize,
-    classify_results: Mutex<Vec<Option<ClassifyResult>>>,
+    next_allowed: AtomicUsize,
+    allow_notify: Notify,
 }
 
-pub struct ParallelCsvSource<D: CsvDecoder> {
+pub struct ParallelCsvSource {
     schema: SchemaRef,
     batch_size: usize,
     boundaries: Arc<[usize]>,
     table_schema: TableSchema,
     metrics: ExecutionPlanMetricsSet,
     state: Arc<SharedState>,
-    decoder: D,
     file_path: ObjectPath,
 }
 
-impl<D: CsvDecoder + Clone> ParallelCsvSource<D> {
+impl ParallelCsvSource {
     pub fn new(
         schema: SchemaRef,
         file_path: ObjectPath,
         boundaries: Arc<[usize]>,
         batch_size: usize,
-        decoder: D,
+    ) -> Self {
+        Self::with_concurrency(schema, file_path, boundaries, batch_size, None)
+    }
+
+    pub fn with_concurrency(
+        schema: SchemaRef,
+        file_path: ObjectPath,
+        boundaries: Arc<[usize]>,
+        batch_size: usize,
+        max_concurrency: Option<usize>,
     ) -> Self {
         let table_schema = TableSchema::from_file_schema(schema.clone());
         let num_partitions = boundaries.len() - 1;
+        let concurrency = max_concurrency.unwrap_or(num_partitions);
 
         let state = Arc::new(SharedState {
-            coordinator: Mutex::new(PartitionResolver::new(boundaries.clone())),
-            barrier: Barrier::new(num_partitions),
-            resolved: OnceCell::new(),
+            resolver: Mutex::new(PartitionResolver::new(boundaries.clone())),
+            partition_ready: (0..num_partitions).map(|_| Notify::new()).collect(),
+            record_aligned_ranges: (0..num_partitions).map(|_| OnceCell::new()).collect(),
+            semaphore: Arc::new(Semaphore::new(concurrency)),
             next_partition: AtomicUsize::new(0),
-            classify_results: Mutex::new((0..num_partitions).map(|_| None).collect()),
+            next_allowed: AtomicUsize::new(0),
+            allow_notify: Notify::new(),
         });
 
         Self {
@@ -111,13 +82,12 @@ impl<D: CsvDecoder + Clone> ParallelCsvSource<D> {
             table_schema,
             metrics: ExecutionPlanMetricsSet::new(),
             state,
-            decoder,
             file_path,
         }
     }
 }
 
-impl<D: CsvDecoder + Clone> Clone for ParallelCsvSource<D> {
+impl Clone for ParallelCsvSource {
     fn clone(&self) -> Self {
         Self {
             schema: self.schema.clone(),
@@ -126,13 +96,12 @@ impl<D: CsvDecoder + Clone> Clone for ParallelCsvSource<D> {
             table_schema: self.table_schema.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
             state: self.state.clone(),
-            decoder: self.decoder.clone(),
             file_path: self.file_path.clone(),
         }
     }
 }
 
-impl<D: CsvDecoder + Clone> FileSource for ParallelCsvSource<D> {
+impl FileSource for ParallelCsvSource {
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
@@ -144,7 +113,6 @@ impl<D: CsvDecoder + Clone> FileSource for ParallelCsvSource<D> {
             batch_size: self.batch_size,
             boundaries: self.boundaries.clone(),
             state: self.state.clone(),
-            decoder: Arc::new(self.decoder.clone()),
             object_store,
             file_path: self.file_path.clone(),
         }))
@@ -181,7 +149,7 @@ impl<D: CsvDecoder + Clone> FileSource for ParallelCsvSource<D> {
     }
 }
 
-impl<D: CsvDecoder + Clone> fmt::Debug for ParallelCsvSource<D> {
+impl fmt::Debug for ParallelCsvSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ParallelCsvSource")
             .field("partitions", &(self.boundaries.len() - 1))
@@ -197,105 +165,128 @@ struct ParallelCsvOpener {
     batch_size: usize,
     boundaries: Arc<[usize]>,
     state: Arc<SharedState>,
-    decoder: Arc<dyn CsvDecoder>,
     object_store: Arc<dyn ObjectStore>,
     file_path: ObjectPath,
 }
 
 impl FileOpener for ParallelCsvOpener {
     fn open(&self, _file: PartitionedFile) -> DatafusionResult<FileOpenFuture> {
-        let partition_idx = self.state.next_partition.fetch_add(1, Ordering::SeqCst);
+        let partition_id = self.state.next_partition.fetch_add(1, Ordering::SeqCst);
 
         let state = self.state.clone();
         let schema = self.schema.clone();
         let batch_size = self.batch_size;
         let boundaries = self.boundaries.clone();
-        let decoder = self.decoder.clone();
         let object_store = self.object_store.clone();
         let file_path = self.file_path.clone();
 
         let (start, end) = {
-            let coord = state.coordinator.lock().unwrap();
-            coord.partition_range(partition_idx)
+            let resolver = state.resolver.lock().unwrap();
+            resolver.get_partition_range_by_id(partition_id)
         };
 
         let num_partitions = boundaries.len() - 1;
         let file_end = boundaries[num_partitions];
-
-        let fetch_start = start.saturating_sub(PADDING_BYTES);
         let fetch_end = (end + PADDING_BYTES).min(file_end);
+        let core_len = end - start;
 
+        let (bytes_tx, bytes_rx) = oneshot::channel::<Payload>();
+
+        // phase 1: fetch partitions and classify
+        // this is eagerly spawned so all partitions make progress concurrently
+        // permits are acquired in partition order to prevent deadlocks
+        // note: the IncrementalResolver needs partition n-1 classified
+        // before partition N can resolve
+        let bg_state = state.clone();
+        tokio::spawn(async move {
+            let result: Result<_, Box<dyn std::error::Error + Send + Sync>> = async {
+                loop {
+                    if bg_state.next_allowed.load(Ordering::Acquire) >= partition_id {
+                        break;
+                    }
+                    bg_state.allow_notify.notified().await;
+                }
+                let permit = bg_state.semaphore.clone().acquire_owned().await?;
+                bg_state
+                    .next_allowed
+                    .fetch_max(partition_id + 1, Ordering::Release);
+                bg_state.allow_notify.notify_waiters();
+
+                let full_bytes = object_store
+                    .get_opts(
+                        &file_path,
+                        GetOptions::new().with_range(Some(start as u64..fetch_end as u64)),
+                    )
+                    .await?
+                    .bytes()
+                    .await?;
+
+                let classify_result = {
+                    let core_bytes = full_bytes.slice(..core_len);
+
+                    tokio::task::spawn_blocking(move || {
+                        let mut scanner = PartitionClassifier::new(PADDING_BYTES);
+                        scanner.ingest(&core_bytes);
+                        scanner.finish()
+                    })
+                    .await?
+                };
+
+                // resolve our partition and neighboring partitions (partition_id and onwards)
+                {
+                    let mut resolver = bg_state.resolver.lock().unwrap();
+                    for (partition_id, split) in resolver.submit(partition_id, classify_result) {
+                        let _ = bg_state.record_aligned_ranges[partition_id].set(split);
+                        bg_state.partition_ready[partition_id].notify_one();
+                    }
+                }
+
+                Ok((full_bytes, permit))
+            }
+            .await;
+
+            match result {
+                Ok(payload) => {
+                    let _ = bytes_tx.send(Ok(payload));
+                }
+                Err(e) => {
+                    let _ = bytes_tx.send(Err(e));
+                }
+            }
+        });
+
+        // phase 2: wait for resolved ranges, then decode
+        // the resolved split gives us record-aligned byte boundaries
         Ok(Box::pin(async move {
-            // phase 1: fetch a range with some padding on both sides
-            let result = object_store
-                .get_opts(
-                    &file_path,
-                    GetOptions::new().with_range(Some(fetch_start as u64..fetch_end as u64)),
-                )
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            loop {
+                if state.record_aligned_ranges[partition_id].get().is_some() {
+                    break;
+                }
 
-            let full_bytes = result
-                .bytes()
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-            // phase 2: classify only the core [start, end) range
-            let core_offset = start - fetch_start;
-            let core_len = end - start;
-            let classify_result = {
-                let core_bytes = full_bytes.slice(core_offset..core_offset + core_len);
-                tokio::task::spawn_blocking(move || {
-                    let mut scanner = SubPartition::new(PADDING_BYTES);
-                    scanner.ingest(&core_bytes);
-                    scanner.finish()
-                })
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?
-            };
-
-            {
-                let mut results = state.classify_results.lock().unwrap();
-                results[partition_idx] = Some(classify_result);
+                state.partition_ready[partition_id].notified().await;
             }
 
-            state.barrier.wait().await;
+            let split = state.record_aligned_ranges[partition_id].get().unwrap();
 
-            // phase 3: resolve quotes and produce aligned ranges
-            let resolved = state
-                .resolved
-                .get_or_init(|| async {
-                    let mut resolver = state.coordinator.lock().unwrap();
-                    {
-                        let mut results = state.classify_results.lock().unwrap();
-                        for (i, result) in results.iter_mut().enumerate() {
-                            resolver.submit(i, result.take().unwrap());
-                        }
-                    }
-                    resolver.resolve()
-                })
-                .await;
+            let (full_bytes, _permit) = bytes_rx
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+                .map_err(DataFusionError::External)?;
 
-            // phase 4: slice to get the aligned range
-            let split = &resolved[partition_idx];
-            let local_start = split
-                .start
-                .checked_sub(fetch_start)
-                .expect("resolved start before fetch_start");
-            let local_end = split.end - fetch_start;
-
-            let aligned_bytes = full_bytes.slice(local_start..local_end);
+            let record_aligned_bytes = full_bytes.slice((split.start - start)..(split.end - start));
 
             let batches = tokio::task::spawn_blocking(move || {
-                decoder.decode(schema, batch_size, &aligned_bytes)
+                let reader = ReaderBuilder::new(schema)
+                    .with_batch_size(batch_size)
+                    .build_buffered(&record_aligned_bytes[..]);
+
+                reader.collect::<Result<Vec<_>, _>>()
             })
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?
             .map_err(DataFusionError::from)?;
 
-            let stream = futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>));
-
-            Ok(stream.boxed())
+            Ok(futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)).boxed())
         }))
     }
 }

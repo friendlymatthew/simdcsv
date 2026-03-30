@@ -28,7 +28,7 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    pub(crate) fn new(schema: SchemaRef, batch_size: usize, has_header: bool) -> Self {
+    pub fn new(schema: SchemaRef, batch_size: usize, has_header: bool) -> Self {
         let num_columns = schema.fields().len();
         Self {
             schema,

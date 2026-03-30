@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::classify::{self, HIGH_NIBBLES, LOW_NIBBLES, NEWLINE, QUOTES};
-use crate::monoid::{ClassifyResult, QuoteParity, prefix_scan};
+use crate::monoid::ClassifyResult;
 use crate::simd::u8x16;
 
 /// A partition streams bytes and produces newline bitsets
@@ -12,7 +12,7 @@ use crate::simd::u8x16;
 ///
 /// This way, memory is O(window).
 #[derive(Debug)]
-pub struct SubPartition {
+pub struct PartitionClassifier {
     newlines_outside: Vec<u64>,
     newlines_inside: Vec<u64>,
     quote_parity: bool,
@@ -21,9 +21,10 @@ pub struct SubPartition {
     remainder: Vec<u8>,
 }
 
-impl SubPartition {
+impl PartitionClassifier {
     pub fn new(window: usize) -> Self {
         let num_words = window / 64 + 1;
+
         Self {
             newlines_outside: Vec::with_capacity(num_words),
             newlines_inside: Vec::with_capacity(num_words),
@@ -130,84 +131,177 @@ impl SubPartition {
 }
 
 #[derive(Debug)]
-pub struct ResolvedSplit {
+pub struct RecordAlignedRange {
     pub start: usize,
     pub end: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RecordStart {
+    Unknown,
+    NoNewline,
+    Found(usize),
+}
+
+impl RecordStart {
+    const fn is_unknown(self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
+// note: partition `i` can be resolved as soon as partition `0..=i+1` submitted their classify results
+#[derive(Debug)]
 pub struct PartitionResolver {
-    boundaries: Arc<[usize]>,
-    results: Vec<Option<ClassifyResult>>,
+    partition_boundaries: Arc<[usize]>,
+    num_partitions: usize,
+    partition_results: Vec<Option<ClassifyResult>>,
+    prefix_parities: Vec<Option<bool>>,
+    record_starts: Vec<RecordStart>,
+    already_computed: Vec<bool>,
 }
 
 impl PartitionResolver {
     pub fn new(boundaries: Arc<[usize]>) -> Self {
         let num_partitions = boundaries.len() - 1;
+
+        let mut prefix_parities = vec![None; num_partitions + 1];
+        prefix_parities[0] = Some(false);
+
+        let mut record_starts = vec![RecordStart::Unknown; num_partitions];
+        record_starts[0] = RecordStart::Found(0);
+
         Self {
-            boundaries,
-            results: (0..num_partitions).map(|_| None).collect(),
+            partition_boundaries: boundaries,
+            num_partitions,
+            partition_results: (0..num_partitions).map(|_| None).collect(),
+            prefix_parities,
+            record_starts,
+            already_computed: vec![false; num_partitions],
         }
     }
 
-    pub fn partition_range(&self, idx: usize) -> (usize, usize) {
-        (self.boundaries[idx], self.boundaries[idx + 1])
+    pub fn get_partition_range_by_id(&self, partition_id: usize) -> (usize, usize) {
+        (
+            self.partition_boundaries[partition_id],
+            self.partition_boundaries[partition_id + 1],
+        )
     }
 
-    pub fn submit(&mut self, partition_idx: usize, result: ClassifyResult) {
-        self.results[partition_idx] = Some(result);
-    }
+    pub fn submit(
+        &mut self,
+        partition_id: usize,
+        result: ClassifyResult,
+    ) -> Vec<(usize, RecordAlignedRange)> {
+        self.partition_results[partition_id] = Some(result);
 
-    pub fn resolve(&self) -> Vec<ResolvedSplit> {
-        let parities = self
-            .results
-            .iter()
-            .map(|r| QuoteParity(r.as_ref().expect("partition not submitted").quote_parity));
+        if partition_id > 0
+            && self.record_starts[partition_id].is_unknown()
+            && let Some(carry) = self.prefix_parities[partition_id]
+        {
+            let result = self.partition_results[partition_id]
+                .as_ref()
+                .expect("above");
 
-        let mut candidates = Vec::with_capacity(self.results.len() + 1);
-        candidates.push((Some(0), false));
-
-        for (i, carry) in prefix_scan(parities).enumerate().skip(1) {
-            let chunk_start = self.boundaries[i];
-            let result = self.results[i].as_ref().expect("results not found");
-
-            let newlines = if carry.0 {
+            let newlines = if carry {
                 &result.newlines_inside
             } else {
                 &result.newlines_outside
             };
 
-            let split = find_first_set_bit(newlines).map(|pos| chunk_start + pos + 1);
-            candidates.push((split, carry.0));
+            let start_offset = self.partition_boundaries[partition_id];
+            self.record_starts[partition_id] = find_first_set_bit(newlines)
+                .map_or(RecordStart::NoNewline, |pos| {
+                    RecordStart::Found(start_offset + pos + 1)
+                });
         }
 
-        let file_end = *self.boundaries.last().unwrap();
+        let propagated_up_to = self.propagate_from(partition_id);
 
-        let mut splits = Vec::with_capacity(candidates.len());
-        let mut prev = None;
+        let lo = partition_id.saturating_sub(1);
+        (lo..=propagated_up_to)
+            .filter_map(|j| {
+                self.try_compute_record_aligned_range_by_id(j)
+                    .map(|split| (j, split))
+            })
+            .collect()
+    }
 
-        for &(curr, carry) in &candidates {
-            let Some(start) = curr else {
-                continue;
-            };
+    // my reasonin ghere is submitting one partition can unlock the parity for partitions _after_ it
+    // might be a premature optimization but, there's no 100% sequential consistent ordering guarantee
+    fn propagate_from(&mut self, from_partition_id: usize) -> usize {
+        let mut last = from_partition_id;
 
-            if let Some((prev_start, _)) = prev {
-                splits.push(ResolvedSplit {
-                    start: prev_start,
-                    end: start,
-                });
+        for partition_id in from_partition_id..self.num_partitions {
+            let next_partition_id = partition_id + 1;
+
+            if self.prefix_parities[next_partition_id].is_none() {
+                match (
+                    self.prefix_parities[partition_id],
+                    self.partition_results[partition_id].as_ref(),
+                ) {
+                    (Some(prev), Some(result)) => {
+                        self.prefix_parities[next_partition_id] = Some(prev ^ result.quote_parity);
+                    }
+                    _ => break,
+                }
             }
 
-            prev = Some((start, carry));
+            // Compute record start for partition next_i (if not already done)
+            if next_partition_id < self.num_partitions
+                && self.record_starts[next_partition_id].is_unknown()
+                && let Some(carry) = self.prefix_parities[next_partition_id]
+                && let Some(result) = self.partition_results[next_partition_id].as_ref()
+            {
+                let newlines = if carry {
+                    &result.newlines_inside
+                } else {
+                    &result.newlines_outside
+                };
+
+                let partition_start = self.partition_boundaries[next_partition_id];
+
+                self.record_starts[next_partition_id] = find_first_set_bit(newlines)
+                    .map_or(RecordStart::NoNewline, |pos| {
+                        RecordStart::Found(partition_start + pos + 1)
+                    });
+            }
+
+            last = next_partition_id.min(self.num_partitions - 1);
         }
 
-        if let Some((start, _)) = prev {
-            splits.push(ResolvedSplit {
-                start,
-                end: file_end,
-            });
+        last
+    }
+
+    fn try_compute_record_aligned_range_by_id(
+        &mut self,
+        partition_id: usize,
+    ) -> Option<RecordAlignedRange> {
+        if self.already_computed[partition_id] {
+            return None;
         }
 
-        splits
+        let start = match self.record_starts[partition_id] {
+            RecordStart::Found(s) => s,
+            RecordStart::NoNewline => {
+                self.already_computed[partition_id] = true;
+                return None;
+            }
+            RecordStart::Unknown => return None,
+        };
+
+        let end = if partition_id == self.num_partitions - 1 {
+            *self.partition_boundaries.last().unwrap()
+        } else {
+            let RecordStart::Found(end) = self.record_starts[partition_id + 1] else {
+                return None;
+            };
+
+            end
+        };
+
+        self.already_computed[partition_id] = true;
+
+        Some(RecordAlignedRange { start, end })
     }
 }
 
@@ -232,45 +326,59 @@ mod tests {
         assert_eq!(find_first_set_bit(&[0, 0b10, 0]), Some(65));
     }
 
-    fn split_two_chunks(chunk0: &[u8], chunk1: &[u8]) -> Vec<ResolvedSplit> {
-        assert_eq!(chunk0.len(), 64);
-        assert_eq!(chunk1.len(), 64);
+    fn classify(data: &[u8]) -> ClassifyResult {
+        let mut s = PartitionClassifier::new(TEST_WINDOW);
+        s.ingest(data);
+        s.finish()
+    }
 
-        let boundaries = vec![0, 64, 128].into();
-
-        let mut s0 = SubPartition::new(TEST_WINDOW);
-        s0.ingest(chunk0);
-
-        let r0 = s0.finish();
-
-        let mut s1 = SubPartition::new(TEST_WINDOW);
-        s1.ingest(chunk1);
-        let r1 = s1.finish();
+    fn resolve_in_order(chunks: &[&[u8; 64]]) -> Vec<RecordAlignedRange> {
+        let n = chunks.len();
+        let boundaries: Arc<[usize]> = (0..=n).map(|i| i * 64).collect::<Vec<_>>().into();
 
         let mut resolver = PartitionResolver::new(boundaries);
-        resolver.submit(0, r0);
-        resolver.submit(1, r1);
+        let mut splits = Vec::new();
 
-        resolver.resolve()
+        for (i, chunk) in chunks.iter().enumerate() {
+            splits.extend(resolver.submit(i, classify(*chunk)));
+        }
+
+        splits.sort_by_key(|(idx, _)| *idx);
+        splits.into_iter().map(|(_, s)| s).collect()
+    }
+
+    fn resolve_in_reverse(chunks: &[&[u8; 64]]) -> Vec<RecordAlignedRange> {
+        let n = chunks.len();
+        let boundaries: Arc<[usize]> = (0..=n).map(|i| i * 64).collect::<Vec<_>>().into();
+
+        let mut resolver = PartitionResolver::new(boundaries);
+        let mut splits = Vec::new();
+
+        for i in (0..n).rev() {
+            splits.extend(resolver.submit(i, classify(chunks[i])));
+        }
+        splits.sort_by_key(|(idx, _)| *idx);
+
+        splits.into_iter().map(|(_, s)| s).collect()
     }
 
     #[test]
-    fn test_simple_split_no_quotes() {
-        let mut chunk0 = [b'x'; 64];
-        chunk0[10] = b'\n';
-        chunk0[30] = b'\n';
+    fn two_partitions_no_quotes() {
+        let mut c0 = [b'x'; 64];
+        c0[10] = b'\n';
+        c0[30] = b'\n';
 
-        let mut chunk1 = [b'x'; 64];
-        chunk1[3] = b'\n';
-        chunk1[20] = b'\n';
+        let mut c1 = [b'x'; 64];
+        c1[3] = b'\n';
+        c1[20] = b'\n';
 
-        insta::assert_debug_snapshot!(split_two_chunks(&chunk0, &chunk1), @r"
+        insta::assert_debug_snapshot!(resolve_in_order(&[&c0, &c1]), @r"
         [
-            ResolvedSplit {
+            RecordAlignedRange {
                 start: 0,
                 end: 68,
             },
-            ResolvedSplit {
+            RecordAlignedRange {
                 start: 68,
                 end: 128,
             },
@@ -279,26 +387,26 @@ mod tests {
     }
 
     #[test]
-    fn test_split_with_quoted_newline() {
-        let mut chunk0 = [b'x'; 64];
-        chunk0[0] = b'a';
-        chunk0[1] = b',';
-        chunk0[2] = b'"';
+    fn two_partitions_quoted_newline() {
+        let mut c0 = [b'x'; 64];
+        c0[0] = b'a';
+        c0[1] = b',';
+        c0[2] = b'"';
 
-        let mut chunk1 = [b'x'; 64];
-        chunk1[0] = b'\n';
-        chunk1[1] = b'z';
-        chunk1[2] = b'"';
-        chunk1[3] = b'\n';
-        chunk1[10] = b'\n';
+        let mut c1 = [b'x'; 64];
+        c1[0] = b'\n';
+        c1[1] = b'z';
+        c1[2] = b'"';
+        c1[3] = b'\n';
+        c1[10] = b'\n';
 
-        insta::assert_debug_snapshot!(split_two_chunks(&chunk0, &chunk1), @r"
+        insta::assert_debug_snapshot!(resolve_in_order(&[&c0, &c1]), @r"
         [
-            ResolvedSplit {
+            RecordAlignedRange {
                 start: 0,
                 end: 68,
             },
-            ResolvedSplit {
+            RecordAlignedRange {
                 start: 68,
                 end: 128,
             },
@@ -307,27 +415,199 @@ mod tests {
     }
 
     #[test]
-    fn test_split_even_parity_no_shift() {
-        let mut chunk0 = [b'x'; 64];
-        chunk0[5] = b'"';
-        chunk0[10] = b'"';
+    fn two_partitions_even_parity() {
+        let mut c0 = [b'x'; 64];
+        c0[5] = b'"';
+        c0[10] = b'"';
 
-        let mut chunk1 = [b'x'; 64];
-        chunk1[0] = b'\n';
-        chunk1[5] = b'\n';
+        let mut c1 = [b'x'; 64];
+        c1[0] = b'\n';
+        c1[5] = b'\n';
 
-        insta::assert_debug_snapshot!(split_two_chunks(&chunk0, &chunk1), @r"
+        insta::assert_debug_snapshot!(resolve_in_order(&[&c0, &c1]), @r"
         [
-            ResolvedSplit {
+            RecordAlignedRange {
                 start: 0,
                 end: 65,
             },
-            ResolvedSplit {
+            RecordAlignedRange {
                 start: 65,
                 end: 128,
             },
         ]
         ");
+    }
+
+    #[test]
+    fn single_partition() {
+        let mut c0 = [b'x'; 64];
+        c0[10] = b'\n';
+
+        let splits = resolve_in_order(&[&c0]);
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].start, 0);
+        assert_eq!(splits[0].end, 64);
+    }
+
+    #[test]
+    fn three_partitions() {
+        let mut c0 = [b'x'; 64];
+        c0[20] = b'\n';
+
+        let mut c1 = [b'x'; 64];
+        c1[5] = b'\n';
+        c1[40] = b'\n';
+
+        let mut c2 = [b'x'; 64];
+        c2[10] = b'\n';
+
+        let splits = resolve_in_order(&[&c0, &c1, &c2]);
+
+        assert_eq!(splits.len(), 3);
+
+        assert_eq!(splits[0].start, 0);
+        assert_eq!(splits[0].end, 70); // first newline in c1 at 64+5, +1a
+
+        assert_eq!(splits[1].start, 70);
+        assert_eq!(splits[1].end, 139); // first newline in c2 at 128+10, +1
+
+        assert_eq!(splits[2].start, 139);
+        assert_eq!(splits[2].end, 192);
+    }
+
+    #[test]
+    fn four_partitions() {
+        let mut c0 = [b'x'; 64];
+        c0[10] = b'\n';
+
+        let mut c1 = [b'x'; 64];
+        c1[2] = b'\n';
+
+        let mut c2 = [b'x'; 64];
+        c2[7] = b'\n';
+
+        let mut c3 = [b'x'; 64];
+        c3[0] = b'\n';
+
+        let splits = resolve_in_order(&[&c0, &c1, &c2, &c3]);
+
+        assert_eq!(splits.len(), 4);
+
+        assert_eq!(splits[0].end, splits[1].start);
+        assert_eq!(splits[1].end, splits[2].start);
+        assert_eq!(splits[2].end, splits[3].start);
+        assert_eq!(splits[3].end, 256);
+    }
+
+    #[test]
+    fn reverse_order_matches_forward() {
+        let mut c0 = [b'x'; 64];
+        c0[10] = b'\n';
+
+        let mut c1 = [b'x'; 64];
+        c1[5] = b'\n';
+
+        let mut c2 = [b'x'; 64];
+        c2[8] = b'\n';
+
+        let mut c3 = [b'x'; 64];
+        c3[3] = b'\n';
+
+        let forward = resolve_in_order(&[&c0, &c1, &c2, &c3]);
+        let reverse = resolve_in_reverse(&[&c0, &c1, &c2, &c3]);
+
+        assert_eq!(forward.len(), reverse.len());
+
+        for (f, r) in forward.iter().zip(&reverse) {
+            assert_eq!(f.start, r.start);
+            assert_eq!(f.end, r.end);
+        }
+    }
+
+    #[test]
+    fn interleaved_submission_order() {
+        let mut c0 = [b'x'; 64];
+        c0[10] = b'\n';
+
+        let mut c1 = [b'x'; 64];
+        c1[5] = b'\n';
+
+        let mut c2 = [b'x'; 64];
+        c2[8] = b'\n';
+
+        let mut c3 = [b'x'; 64];
+        c3[3] = b'\n';
+
+        let chunks = [&c0, &c1, &c2, &c3];
+        let boundaries: Arc<[usize]> = vec![0, 64, 128, 192, 256].into();
+
+        let mut resolver = PartitionResolver::new(boundaries);
+        let mut splits = Vec::new();
+
+        for i in [2, 0, 3, 1] {
+            splits.extend(resolver.submit(i, classify(chunks[i])));
+        }
+
+        splits.sort_by_key(|(idx, _)| *idx);
+
+        let splits = splits.into_iter().map(|(_, s)| s).collect::<Vec<_>>();
+
+        let expected = resolve_in_order(&chunks);
+        assert_eq!(splits.len(), expected.len());
+
+        for (a, b) in splits.iter().zip(&expected) {
+            assert_eq!(a.start, b.start);
+            assert_eq!(a.end, b.end);
+        }
+    }
+
+    #[test]
+    fn three_partitions_with_odd_parity() {
+        let mut c0 = [b'x'; 64];
+        c0[5] = b'"';
+        c0[20] = b'\n';
+
+        let mut c1 = [b'x'; 64];
+        c1[0] = b'\n';
+        c1[3] = b'"';
+        c1[5] = b'\n';
+        c1[10] = b'\n';
+
+        let mut c2 = [b'x'; 64];
+        c2[2] = b'\n';
+
+        let splits = resolve_in_order(&[&c0, &c1, &c2]);
+
+        assert_eq!(splits.len(), 3);
+        assert_eq!(splits[1].start, 70);
+    }
+
+    #[test]
+    fn ranges_are_contiguous() {
+        let mut c0 = [b'x'; 64];
+        c0[15] = b'\n';
+
+        let mut c1 = [b'x'; 64];
+        c1[3] = b'\n';
+
+        let mut c2 = [b'x'; 64];
+        c2[7] = b'\n';
+
+        let mut c3 = [b'x'; 64];
+        c3[1] = b'\n';
+
+        let mut c4 = [b'x'; 64];
+        c4[9] = b'\n';
+
+        let splits = resolve_in_order(&[&c0, &c1, &c2, &c3, &c4]);
+
+        assert_eq!(splits.len(), 5);
+        assert_eq!(splits[0].start, 0);
+        assert_eq!(splits[4].end, 320);
+
+        for i in 0..4 {
+            assert_eq!(splits[i].end, splits[i + 1].start);
+        }
     }
 
     #[test]
@@ -338,7 +618,7 @@ mod tests {
         data[200] = b'"';
         data[201] = b'"';
 
-        let mut chunk = SubPartition::new(64);
+        let mut chunk = PartitionClassifier::new(64);
         chunk.ingest(&data);
         let result = chunk.finish();
 
@@ -346,18 +626,12 @@ mod tests {
         assert_eq!(result.newlines_outside.len(), 1);
     }
 
-    fn scan_chunk(chunk: &[u8; 64]) -> ClassifyResult {
-        let mut s = SubPartition::new(TEST_WINDOW);
-        s.ingest(chunk);
-        s.finish()
-    }
-
     #[test]
     fn test_classify_result_identity() {
         let mut c = [b'x'; 64];
         c[0] = b'"';
         c[5] = b'\n';
-        let m = scan_chunk(&c);
+        let m = classify(&c);
         let e = ClassifyResult::identity();
 
         assert_eq!(e.combine(&m), m);
@@ -381,9 +655,9 @@ mod tests {
         c2[2] = b'"';
         c2[7] = b'\n';
 
-        let a = scan_chunk(&c0);
-        let b = scan_chunk(&c1);
-        let c = scan_chunk(&c2);
+        let a = classify(&c0);
+        let b = classify(&c1);
+        let c = classify(&c2);
 
         assert_eq!(a.combine(&b).combine(&c), a.combine(&b.combine(&c)));
     }

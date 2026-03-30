@@ -1,44 +1,14 @@
-pub trait Monoid: Sized {
-    fn identity() -> Self;
-    fn combine(&self, rhs: &Self) -> Self;
-}
-
-// exclusive prefix scan under a monoid
-pub fn prefix_scan<I, M: Monoid + Clone>(elements: I) -> impl Iterator<Item = M>
-where
-    I: IntoIterator<Item = M>,
-{
-    elements.into_iter().scan(M::identity(), |acc, elem| {
-        let prev = acc.clone();
-        *acc = acc.combine(&elem);
-        Some(prev)
-    })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct QuoteParity(pub bool);
-
-impl From<bool> for QuoteParity {
-    fn from(b: bool) -> Self {
-        Self(b)
-    }
-}
-
-impl Monoid for QuoteParity {
-    fn identity() -> Self {
-        Self(false)
-    }
-
-    fn combine(&self, rhs: &Self) -> Self {
-        Self(self.0 ^ rhs.0)
-    }
-}
-
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ClassifyResult {
     pub newlines_outside: Vec<u64>,
     pub newlines_inside: Vec<u64>,
     pub quote_parity: bool,
+}
+
+#[cfg(test)]
+pub trait Monoid: Sized {
+    fn identity() -> Self;
+    fn combine(&self, rhs: &Self) -> Self;
 }
 
 #[cfg(test)]
@@ -76,18 +46,35 @@ impl Monoid for ClassifyResult {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct QuoteParity(bool);
+
+    impl From<bool> for QuoteParity {
+        fn from(b: bool) -> Self {
+            Self(b)
+        }
+    }
+
+    impl Monoid for QuoteParity {
+        fn identity() -> Self {
+            Self(false)
+        }
+
+        fn combine(&self, rhs: &Self) -> Self {
+            Self(self.0 ^ rhs.0)
+        }
+    }
+
     #[test]
     fn test_quote_parity_laws_exhaustive() {
         let vals = [false.into(), true.into()];
 
         for &a in &vals {
-            // identity
             assert_eq!(QuoteParity::identity().combine(&a), a);
             assert_eq!(a.combine(&QuoteParity::identity()), a);
 
             for &b in &vals {
                 for &c in &vals {
-                    // associativity
                     assert_eq!(a.combine(&b).combine(&c), a.combine(&b.combine(&c)));
                 }
             }

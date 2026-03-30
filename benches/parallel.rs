@@ -6,11 +6,12 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::prelude::{CsvReadOptions, SessionConfig, SessionContext};
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::source::DataSourceExec;
+use duckdb::{Config, Connection};
 use object_store::path::Path as ObjectPath;
 use tokio::runtime::Runtime;
 
+use arrow_csv2::ParallelCsvSource;
 use arrow_csv2::clickbench;
-use arrow_csv2::{ArrowCsv2Decoder, ParallelCsvSource};
 
 const FILE: &str = "hits_100mb.csv";
 const BATCH_SIZE: usize = 8192;
@@ -35,7 +36,6 @@ fn build_parallel_csv(
         object_path,
         boundaries.clone(),
         BATCH_SIZE,
-        ArrowCsv2Decoder,
     ));
 
     let url = ObjectStoreUrl::parse("file://").unwrap();
@@ -55,11 +55,11 @@ fn bench_parallel_csv(c: &mut Criterion) {
     let schema = clickbench::schema();
     let rt = Runtime::new().unwrap();
 
-    let mut group = c.benchmark_group("parallel csv (clickbench 100MB)");
+    let mut group = c.benchmark_group("arrow-csv2 (clickbench 100MB)");
     group.sample_size(10);
 
     for num_partitions in [1, 2, 4, 8, 12, 16] {
-        group.bench_function(format!("parallel-csv ({num_partitions}p)"), |b| {
+        group.bench_function(format!("arrow-csv2 ({num_partitions}p)"), |b| {
             b.to_async(&rt).iter(|| {
                 let schema = schema.clone();
                 async move {
@@ -94,6 +94,7 @@ fn bench_datafusion_csv(c: &mut Criterion) {
                         .has_header(false)
                         .schema(schema.as_ref())
                         .file_extension(".csv");
+
                     let df = ctx.read_csv(FILE, opts).await.unwrap();
                     df.collect().await.unwrap()
                 }
@@ -113,6 +114,7 @@ fn bench_datafusion_csv(c: &mut Criterion) {
                     .schema(schema.as_ref())
                     .newlines_in_values(true)
                     .file_extension(".csv");
+
                 let df = ctx.read_csv(FILE, opts).await.unwrap();
                 df.collect().await.unwrap()
             }
@@ -122,5 +124,65 @@ fn bench_datafusion_csv(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_parallel_csv, bench_datafusion_csv);
+/*
+duckdb's poor numbers are a bit suspect to me
+
+from what I can gather, the benchmark closure is measuring DuckDB's csv parsing + the Arrow schema conversion
+though most of the cost is definitely coming from the former
+*/
+fn bench_duckdb_csv(c: &mut Criterion) {
+    use arrow_schema::DataType;
+
+    let abs_path = std::fs::canonicalize(FILE).expect("hits_100mb.csv not found");
+    let path_str = abs_path.to_str().unwrap();
+
+    let schema = clickbench::schema();
+    let columns: String = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let duckdb_type = match f.data_type() {
+                DataType::Int16 => "SMALLINT",
+                DataType::Int32 => "INTEGER",
+                DataType::Int64 => "BIGINT",
+                DataType::Utf8 => "VARCHAR",
+                other => panic!("unmapped type: {other:?}"),
+            };
+            format!("'{}': '{}'", f.name(), duckdb_type)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut group = c.benchmark_group("duckdb csv (clickbench 100MB)");
+    group.sample_size(10);
+
+    for num_threads in [1, 2, 4, 8, 12, 16] {
+        let query =
+            format!("SELECT * FROM read_csv('{path_str}', header=false, columns={{{columns}}})");
+        let config = Config::default()
+            .with("threads", num_threads.to_string())
+            .unwrap();
+        let conn = Connection::open_in_memory_with_flags(config).unwrap();
+
+        group.bench_function(format!("duckdb-csv ({num_threads}t)"), |b| {
+            b.iter(|| {
+                // prepare outside the loop lets DuckDb cache the query plan
+                // datafusion's collect rebuilds the plan every iteration
+                let mut stmt = conn.prepare(&query).unwrap();
+                let rows = stmt.query_arrow([]).unwrap();
+                let batches = rows.collect::<Vec<_>>();
+                assert!(!batches.is_empty());
+            });
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_parallel_csv,
+    bench_datafusion_csv,
+    bench_duckdb_csv
+);
 criterion_main!(benches);
