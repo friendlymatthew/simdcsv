@@ -31,11 +31,12 @@ duckdb = { version = "1.10501", features = ["bundled"] }
 [[bin]]
 name = "slice_clickbench"
 path = "bin/slice_clickbench.rs"
-
+bench = false
 
 [[bin]]
 name = "parse_clickbench"
 path = "bin/parse_clickbench.rs"
+bench = false
 
 [[bench]]
 name = "parallel"
@@ -46,3 +47,6 @@ debug = 2
 lto = "fat"
 panic = "abort"
 codegen-units = 1
+
+[lib]
+bench = false

@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
-use crate::classify::{self, HIGH_NIBBLES, LOW_NIBBLES, NEWLINE, QUOTES};
+use crate::classify::{
+    self, HIGH_NIBBLES, LOW_NIBBLES, NEWLINE, QUOTES, build_eq_bitset, classify_four_lanes,
+};
 use crate::monoid::ClassifyResult;
-use crate::simd::u8x16;
+use crate::simd::{u8x16, u8x16x4};
 
 /// A partition streams bytes and produces newline bitsets
 /// for both possible initial quote states
@@ -91,15 +93,16 @@ impl PartitionClassifier {
 
     #[inline(always)]
     fn classify_block_full(&mut self, block: &[u8; 64]) {
-        let low_nib = u8x16::from_slice_unchecked(&LOW_NIBBLES);
-        let high_nib = u8x16::from_slice_unchecked(&HIGH_NIBBLES);
         let newline_bc = u8x16::broadcast(NEWLINE);
         let quote_bc = u8x16::broadcast(QUOTES);
+        let table = u8x16x4::from_slice_unchecked(&classify::BYTE_TABLE);
+        let bitmask1 = u8x16::broadcast(0x55);
+        let bitmask2 = u8x16::broadcast(0x33);
 
-        let (c0, c1, c2, c3) = classify::classify_four_lanes(block, high_nib, low_nib);
+        let (classified) = classify_four_lanes(block, table);
 
-        let quote = classify::build_eq_bitset(c0, c1, c2, c3, quote_bc);
-        let raw_newline = classify::build_eq_bitset(c0, c1, c2, c3, newline_bc);
+        let raw_newline = build_eq_bitset(classified, newline_bc, bitmask1, bitmask2);
+        let quote = build_eq_bitset(classified, quote_bc, bitmask1, bitmask2);
 
         let inside = unsafe { std::arch::aarch64::vmull_p64(quote, 0xFFFFFFFFFFFFFFFF_u64) } as u64;
 
