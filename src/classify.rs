@@ -1,5 +1,8 @@
-use std::arch::aarch64::{uint8x16x4_t, vbslq_u8, vceqq_u8, vdupq_n_u8, vget_lane_u64, vld4q_u8, vqtbl4q_u8, vreinterpret_u64_s8, vreinterpretq_s16_u8, vshrn_n_s16};
 use crate::simd::{u8x16, u8x16x4};
+use std::arch::aarch64::{
+    uint8x16x4_t, vbslq_u8, vceqq_u8, vdupq_n_u8, vget_lane_u64, vld4q_u8, vqtbl4q_u8,
+    vreinterpret_u64_s8, vreinterpretq_s16_u8, vshrn_n_s16,
+};
 
 pub const COMMA: u8 = 1;
 pub const NEWLINE: u8 = 2;
@@ -78,10 +81,7 @@ pub fn classify_and_mask(data: &[u8]) -> ClassifyResult {
 }
 
 #[inline(always)]
-pub fn classify_four_lanes(
-    chunk: &[u8; 64],
-    byte_table: u8x16x4,
-) -> u8x16x4 {
+pub fn classify_four_lanes(chunk: &[u8; 64], byte_table: u8x16x4) -> u8x16x4 {
     unsafe {
         let v = vld4q_u8(chunk.as_ptr());
         uint8x16x4_t(
@@ -89,7 +89,8 @@ pub fn classify_four_lanes(
             vqtbl4q_u8(byte_table.into(), v.1),
             vqtbl4q_u8(byte_table.into(), v.2),
             vqtbl4q_u8(byte_table.into(), v.3),
-        ).into()
+        )
+        .into()
     }
 }
 
@@ -97,8 +98,16 @@ pub fn classify_four_lanes(
 pub fn build_eq_bitset(c: u8x16x4, bc: u8x16, bitmask1: u8x16, bitmask2: u8x16) -> u64 {
     let raw: uint8x16x4_t = c.into();
     unsafe {
-        let t0 = vbslq_u8(bitmask1.into(), vceqq_u8(raw.0, bc.into()), vceqq_u8(raw.1, bc.into())); // 01010101...
-        let t1 = vbslq_u8(bitmask1.into(), vceqq_u8(raw.2, bc.into()), vceqq_u8(raw.3, bc.into())); // 23232323...
+        let t0 = vbslq_u8(
+            bitmask1.into(),
+            vceqq_u8(raw.0, bc.into()),
+            vceqq_u8(raw.1, bc.into()),
+        ); // 01010101...
+        let t1 = vbslq_u8(
+            bitmask1.into(),
+            vceqq_u8(raw.2, bc.into()),
+            vceqq_u8(raw.3, bc.into()),
+        ); // 23232323...
         let combined = vbslq_u8(bitmask2.into(), t0, t1); // 01230123...
         let sum = vshrn_n_s16::<4>(vreinterpretq_s16_u8(combined));
         vget_lane_u64::<0>(vreinterpret_u64_s8(sum))

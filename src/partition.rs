@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::classify::{self, build_eq_bitset, classify_four_lanes, HIGH_NIBBLES, LOW_NIBBLES, NEWLINE, QUOTES};
+use crate::classify::{
+    self, HIGH_NIBBLES, LOW_NIBBLES, NEWLINE, QUOTES, build_eq_bitset, classify_four_lanes,
+};
 use crate::monoid::ClassifyResult;
 use crate::simd::{u8x16, u8x16x4};
 
